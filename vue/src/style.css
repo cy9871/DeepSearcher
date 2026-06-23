@@ -1,0 +1,62 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  min-height: 100dvh;
+}
+
+/* Markdown rendered result */
+.prose-answer h2 {
+  @apply mt-8 mb-3 text-xl font-semibold tracking-tight text-zinc-900;
+}
+.prose-answer h3 {
+  @apply mt-6 mb-2 text-lg font-medium text-zinc-800;
+}
+.prose-answer p {
+  @apply mb-3 leading-relaxed text-zinc-700;
+}
+.prose-answer ul {
+  @apply mb-4 ml-5 list-disc space-y-1 text-zinc-700;
+}
+.prose-answer ol {
+  @apply mb-4 ml-5 list-decimal space-y-1 text-zinc-700;
+}
+.prose-answer code {
+  @apply rounded bg-zinc-100 px-1.5 py-0.5 text-sm font-mono text-zinc-800;
+}
+.prose-answer pre {
+  @apply mb-4 overflow-x-auto rounded-xl bg-zinc-900 p-4 text-sm text-zinc-100;
+}
+.prose-answer pre code {
+  @apply bg-transparent p-0 text-zinc-100;
+}
+.prose-answer blockquote {
+  @apply my-4 border-l-2 border-accent-400 pl-4 text-zinc-600 italic;
+}
+.prose-answer strong {
+  @apply font-semibold text-zinc-900;
+}
+.prose-answer a {
+  @apply text-accent-600 underline decoration-accent-300 underline-offset-2 hover:decoration-accent-500;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-zinc-200;
+}
+
+/* Diary log animation */
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.diary-entry {
+  animation: fadeSlideIn 0.2s ease-out;
+}

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Node
+node_modules/
+vue/node_modules/
+vue/dist/
+
+# Runtime
+results/*
+!results/.gitkeep
+deepsearcher/results/*
+!deepsearcher/results/.gitkeep
+*.log
+
+# OS
+.DS_Store
