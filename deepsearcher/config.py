@@ -1,16 +1,31 @@
 """
 Deep Research Agent 配置
 
-LLM 层走 QClaw 内部网关（localhost，无需个人 API key）。
-OpenAI 兼容格式，可随时切换模型提供商。
+LLM 层走 QClaw 内部网关（localhost:57036，OpenAI 兼容格式）。
+自动读取网关 token，也可通过环境变量覆盖。
 """
 
+import json
 import os
+
+
+def _get_gateway_token() -> str:
+    """从 OpenClaw 配置文件自动读取 gateway token"""
+    env_token = os.environ.get("DEEPSEARCH_API_KEY", "")
+    if env_token:
+        return env_token
+    try:
+        config_path = os.path.expanduser("~/.qclaw/openclaw.json")
+        with open(config_path) as f:
+            return json.load(f)["gateway"]["auth"]["token"]
+    except Exception:
+        return ""
+
 
 # ── LLM 配置（走 QClaw 内部网关）────────────────────────────────
 LLM_CONFIG = {
-    "base_url": os.environ.get("DEEPSEARCH_BASE_URL", "http://localhost:56685/v1"),
-    "api_key": os.environ.get("DEEPSEARCH_API_KEY", ""),
+    "base_url": os.environ.get("DEEPSEARCH_BASE_URL", "http://localhost:57036/v1"),
+    "api_key": _get_gateway_token(),
     "model": os.environ.get("DEEPSEARCH_MODEL", "openclaw"),
     "temperature": 0.1,
     "max_tokens": 4096,

@@ -12,6 +12,7 @@
           </router-link>
           <nav class="flex items-center gap-4">
             <router-link to="/history" class="text-xs text-zinc-400 hover:text-zinc-600 transition-colors">历史</router-link>
+            <router-link to="/eval" class="text-xs text-zinc-400 hover:text-zinc-600 transition-colors">评估</router-link>
           </nav>
         <span class="text-xs text-zinc-400">深度研究 Agent</span>
       </div>

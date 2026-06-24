@@ -30,6 +30,8 @@ from pydantic import BaseModel
 
 from .agent import deep_research as deep_search
 from .config import MAX_TURNS, TOKEN_BUDGET
+from .evaluator.storage import MetricsStorage, compute_summary
+from .evaluator.reporter import MetricsReporter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("server")
@@ -130,8 +132,8 @@ def _rebuild_index():
                     d = json.load(f)
             except Exception:
                 continue
-            result = d.get("result", {})
-            refs = result.get("references", {})
+            result = d.get("result") or {}
+            refs = result.get("references") or {}
             index.append({
                 "task_id": d.get("task_id", fname[:-5]),
                 "question": d.get("question", ""),
@@ -491,6 +493,177 @@ async def list_tasks():
         }
         for tid, t in tasks.items()
     }
+
+
+# ── 评估 API ───────────────────────────────────────────────────
+
+@app.get("/api/eval/summary")
+async def get_eval_summary():
+    """获取 Agent 效果评估全量聚合摘要"""
+    try:
+        storage = MetricsStorage()
+        summary = compute_summary(storage)
+        reporter = MetricsReporter(storage)
+        return {
+            "text_report": reporter.format_text(summary),
+            "data": {
+                "total_tasks": summary.total_tasks,
+                "generated_at": summary.generated_at,
+                "task_completion": {
+                    "total": summary.task_completion.total_tasks,
+                    "completed": summary.task_completion.completed,
+                    "completion_rate": summary.task_completion.completion_rate,
+                    "beast_mode_rate": summary.task_completion.beast_mode_rate,
+                    "eval_pass_rate": summary.task_completion.eval_pass_rate,
+                },
+                "tool_accuracy": [
+                    {
+                        "action_type": ta.action_type,
+                        "total": ta.total,
+                        "successful": ta.successful,
+                        "success_rate": ta.success_rate,
+                        "avg_elapsed_ms": ta.avg_elapsed_ms,
+                    }
+                    for ta in summary.tool_accuracy
+                ],
+                "path_analysis": {
+                    "min_steps": summary.path_analysis.min_steps,
+                    "max_steps": summary.path_analysis.max_steps,
+                    "mean_steps": summary.path_analysis.mean_steps,
+                    "median_steps": summary.path_analysis.median_steps,
+                    "action_distribution": summary.path_analysis.action_distribution,
+                    "difficulty_distribution": summary.path_analysis.difficulty_distribution,
+                },
+                "timing_profile": {
+                    "avg_total_ms": summary.timing_profile.avg_total_ms,
+                    "avg_per_step_ms": summary.timing_profile.avg_per_step_ms,
+                    "p50_total_ms": summary.timing_profile.p50_total_ms,
+                    "p95_total_ms": summary.timing_profile.p95_total_ms,
+                    "avg_llm_calls": summary.timing_profile.avg_llm_calls,
+                    "avg_llm_tokens": summary.timing_profile.avg_llm_tokens,
+                    "slowest_action_type": summary.timing_profile.slowest_action_type,
+                    "action_avg_timing": summary.timing_profile.action_avg_timing,
+                },
+                "anomaly_report": {
+                    "empty_search_rate": summary.anomaly_report.empty_search_rate,
+                    "empty_visit_rate": summary.anomaly_report.empty_visit_rate,
+                    "eval_failure_rate": summary.anomaly_report.eval_failure_rate,
+                    "hard_intercept_rate": summary.anomaly_report.hard_intercept_rate,
+                    "llm_error_rate": summary.anomaly_report.llm_error_rate,
+                    "beast_mode_rate": summary.anomaly_report.beast_mode_rate,
+                    "action_failure_rate": summary.anomaly_report.action_failure_rate,
+                    "top_failure_types": summary.anomaly_report.top_failure_types,
+                },
+            },
+        }
+    except Exception as e:
+        raise HTTPException(500, f"评估摘要生成失败: {e}")
+
+
+@app.get("/api/eval/text")
+async def get_eval_text_report():
+    """获取纯文本格式评估报告"""
+    try:
+        storage = MetricsStorage()
+        summary = compute_summary(storage)
+        reporter = MetricsReporter(storage)
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(reporter.format_text(summary))
+    except Exception as e:
+        raise HTTPException(500, f"文本报告生成失败: {e}")
+
+
+@app.get("/api/eval/tasks")
+async def list_eval_tasks():
+    """列出所有已评估的任务"""
+    try:
+        storage = MetricsStorage()
+        return storage.get_metrics_index()
+    except Exception as e:
+        raise HTTPException(500, f"任务列表获取失败: {e}")
+
+
+@app.get("/api/eval/task/{task_id}")
+async def get_eval_task(task_id: str):
+    """获取单个任务的详细指标"""
+    try:
+        storage = MetricsStorage()
+        metrics = storage.load_task_metrics(task_id)
+        if not metrics:
+            raise HTTPException(404, f"任务 {task_id} 的指标不存在")
+        reporter = MetricsReporter(storage)
+        return {
+            "text_report": reporter.format_task_text(metrics),
+            "data": {
+                "task_id": metrics.task_id,
+                "question": metrics.question,
+                "completed": metrics.completed,
+                "beast_mode_triggered": metrics.beast_mode_triggered,
+                "eval_passed": metrics.eval_passed,
+                "eval_attempts": metrics.eval_attempts,
+                "total_actions": metrics.total_actions,
+                "successful_actions": metrics.successful_actions,
+                "steps_taken": metrics.steps_taken,
+                "max_steps_allowed": metrics.max_steps_allowed,
+                "actions_by_type": metrics.actions_by_type,
+                "total_elapsed_ms": metrics.total_elapsed_ms,
+                "per_step_avg_ms": metrics.per_step_avg_ms,
+                "llm_total_calls": metrics.llm_total_calls,
+                "llm_total_tokens": metrics.llm_total_tokens,
+                "action_timing": metrics.action_timing,
+                "failed_actions": metrics.failed_actions,
+                "empty_searches": metrics.empty_searches,
+                "empty_visits": metrics.empty_visits,
+                "evaluation_failures": metrics.evaluation_failures,
+                "hard_intercepts": metrics.hard_intercepts,
+                "llm_errors": metrics.llm_errors,
+                "created_at": metrics.created_at,
+                "difficulty_label": metrics.difficulty_label,
+                "action_records": [
+                    {
+                        "type": r.action_type,
+                        "step": r.step,
+                        "success": r.success,
+                        "elapsed_ms": r.elapsed_ms,
+                        "llm_calls": r.llm_calls,
+                        "extra": r.extra,
+                    }
+                    for r in metrics.action_records
+                ],
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"任务指标获取失败: {e}")
+
+
+@app.get("/api/eval/export")
+async def export_eval_json():
+    """导出完整 JSON 评估报告"""
+    try:
+        storage = MetricsStorage()
+        reporter = MetricsReporter(storage)
+        return {"json": reporter.export_json()}
+    except Exception as e:
+        raise HTTPException(500, f"导出失败: {e}")
+
+
+@app.get("/api/eval/text/{task_id}")
+async def get_eval_task_text(task_id: str):
+    """获取单个任务的纯文本指标报告"""
+    try:
+        storage = MetricsStorage()
+        metrics = storage.load_task_metrics(task_id)
+        if not metrics:
+            raise HTTPException(404, f"任务 {task_id} 的指标不存在")
+        reporter = MetricsReporter(storage)
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(reporter.format_task_text(metrics))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"文本报告生成失败: {e}")
 
 
 # ── 历史 API ───────────────────────────────────────────────────

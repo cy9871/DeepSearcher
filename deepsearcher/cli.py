@@ -47,6 +47,22 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level",
     )
+    parser.add_argument(
+        "--metrics", "-m",
+        action="store_true",
+        help="Print agent evaluation metrics after research completes",
+    )
+    parser.add_argument(
+        "--metrics-only",
+        action="store_true",
+        help="Only print evaluation summary (no research)",
+    )
+    parser.add_argument(
+        "--metrics-task",
+        type=str,
+        default="",
+        help="Show metrics for a specific task ID (no research)",
+    )
     return parser.parse_args()
 
 
@@ -61,6 +77,37 @@ def main() -> None:
     args = parse_args()
     setup_logging(args.log_level)
 
+    # ── 纯指标模式 ────────────────────────────────────────────
+    if args.metrics_only:
+        from .evaluator.storage import MetricsStorage, compute_summary
+        from .evaluator.reporter import MetricsReporter
+        storage = MetricsStorage()
+        if storage.task_count() == 0:
+            print("暂无评估数据。先运行一次研究任务。")
+            sys.exit(0)
+        reporter = MetricsReporter(storage)
+        reporter.print_summary()
+        return
+
+    if args.metrics_task:
+        from .evaluator.storage import MetricsStorage
+        from .evaluator.reporter import MetricsReporter
+        storage = MetricsStorage()
+        metrics = storage.load_task_metrics(args.metrics_task)
+        if not metrics:
+            print(f"任务 {args.metrics_task} 的指标数据不存在")
+            # 尝试模糊匹配
+            tasks = storage.get_metrics_index()
+            if tasks:
+                print(f"可用的任务 ID:")
+                for t in tasks[:10]:
+                    print(f"  {t['task_id']} — {t.get('question', '?')[:50]}")
+            sys.exit(1)
+        reporter = MetricsReporter(storage)
+        print(reporter.format_task_text(metrics))
+        return
+
+    # ── 研究模式 ──────────────────────────────────────────────
     question = args.question
     if not question:
         question = sys.stdin.read().strip()
@@ -102,6 +149,22 @@ def main() -> None:
         for i, q in enumerate(result["follow_up_questions"], 1):
             print(f"  {i}. {q}")
         print()
+
+    # ── 指标输出 ──────────────────────────────────────────────
+    if args.metrics:
+        from .evaluator.storage import MetricsStorage
+        from .evaluator.reporter import MetricsReporter
+        storage = MetricsStorage()
+        reporter = MetricsReporter(storage)
+        # 最近的task指标
+        tasks = storage.get_metrics_index()
+        if tasks:
+            latest = storage.load_task_metrics(tasks[0]["task_id"])
+            if latest:
+                print(reporter.format_task_text(latest))
+        # 全量摘要
+        if storage.task_count() > 1:
+            reporter.print_summary()
 
 
 if __name__ == "__main__":

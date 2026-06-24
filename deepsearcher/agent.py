@@ -19,6 +19,7 @@ if os.path.isdir(_venv):
 import asyncio
 import json
 import logging
+import time
 from typing import Literal
 
 from .config import (
@@ -54,6 +55,8 @@ from .utils.text_tools import (
     format_knowledge_for_context,
     estimate_tokens,
 )
+from .evaluator.metrics import MetricsCollector, ActionRecord
+from .evaluator.storage import MetricsStorage
 
 from urllib.parse import urlparse
 
@@ -502,6 +505,14 @@ async def deep_research(
     logger.info(f"🔍 Deep Research 启动: {question[:60]}...")
     logger.info(f"   budget={token_budget}, max_turns={max_turns}")
 
+    # ── 指标采集器 ────────────────────────────────────────────
+    metrics_collector = MetricsCollector(
+        task_id="",  # 将在结果返回前填入
+        question=question,
+        max_turns=max_turns,
+        token_budget=token_budget,
+    )
+
     # 初始化状态
     state = {
         "question": question,
@@ -558,7 +569,21 @@ async def deep_research(
         if state["step_count"] == 1:
             queries = state["gaps"][:3]
             logger.info(f"  首轮 → search: {queries}")
+            t0 = time.monotonic()
             updates = await _execute_search(state, queries)
+            dt_ms = (time.monotonic() - t0) * 1000
+            # 记录指标
+            urls_before = len([u for u in state.get("urls_to_visit", []) if u not in set(state.get("visited_urls", []))])
+            all_new_urls = updates.get("all_urls", {})
+            results_found = sum(1 for k in all_new_urls if k not in state.get("all_urls", {}))
+            metrics_collector.record_action(ActionRecord(
+                action_type="search",
+                step=state["step_count"],
+                success=results_found > 0,
+                elapsed_ms=dt_ms,
+                llm_calls=0,
+                extra={"queries": len(queries), "results_found": results_found, "urls_queued": 0},
+            ))
             state.update(updates)
             state["diary_context"].append(f"[step 1] 首轮搜索 {len(queries)} 个查询")
             p = len([u for u in state.get("urls_to_visit", []) if u not in set(state.get("visited_urls", []))])
@@ -585,11 +610,30 @@ async def deep_research(
             logger.info(f"  ⛔ 硬拦截：{unvisited_count} 个 URL 未读，强制 visit")
             action.type = "visit"
             state["diary_context"].append(f"[⛔ 硬拦截] 待读队列还有 {unvisited_count} 个 URL，禁止提前 answer")
+            metrics_collector.mark_hard_intercept()
 
         # 执行动作
         try:
+            t_action_start = time.monotonic()
             if action.type == "search":
                 updates = await _execute_search(state, action.search_queries or state["gaps"][:2])
+                dt_ms = (time.monotonic() - t_action_start) * 1000
+                # 计算搜索效果
+                all_new_urls = updates.get("all_urls", {})
+                existing_urls = set(state.get("all_urls", {}).keys())
+                new_urls_count = sum(1 for k in all_new_urls if k not in existing_urls)
+                metrics_collector.record_action(ActionRecord(
+                    action_type="search",
+                    step=state["step_count"],
+                    success=new_urls_count > 0,
+                    elapsed_ms=dt_ms,
+                    llm_calls=0,  # search 本身不调 LLM
+                    extra={
+                        "queries": len(action.search_queries or state["gaps"][:2]),
+                        "results_found": new_urls_count,
+                        "urls_queued": 0,
+                    },
+                ))
             elif action.type == "visit":
                 # 从待读队列取 URL
                 todo = state.get("urls_to_visit", [])
@@ -604,22 +648,71 @@ async def deep_research(
                         u.url for u in state["all_urls"].values()
                         if u.url not in visited_set
                     ][:MAX_URLS_TO_READ]
+                knowledge_before = len(state.get("all_knowledge", []))
                 updates = await _execute_visit(state, target_urls[:MAX_URLS_TO_READ])
+                dt_ms = (time.monotonic() - t_action_start) * 1000
+                knowledge_after = len(state.get("all_knowledge", [])) + len(updates.get("all_knowledge", []))
+                knowledge_gained = knowledge_after - knowledge_before
+                # 计算读取成功率
+                read_total = len(target_urls[:MAX_URLS_TO_READ])
+                visited_after = set(state.get("visited_urls", []) + updates.get("visited_urls", []))
+                read_failures = max(0, read_total - len(visited_after - visited_set))
+                metrics_collector.record_action(ActionRecord(
+                    action_type="visit",
+                    step=state["step_count"],
+                    success=knowledge_gained > 0,
+                    elapsed_ms=dt_ms,
+                    llm_calls=1,  # _summarize_content 调用 LLM
+                    extra={
+                        "urls_read": read_total,
+                        "knowledge_extracted": knowledge_gained,
+                        "read_failures": read_failures,
+                    },
+                ))
             elif action.type == "reflect":
                 updates = await _execute_reflect(state)
+                dt_ms = (time.monotonic() - t_action_start) * 1000
+                gaps_found = len(updates.get("gaps", []))
+                metrics_collector.record_action(ActionRecord(
+                    action_type="reflect",
+                    step=state["step_count"],
+                    success=gaps_found > 0,
+                    elapsed_ms=dt_ms,
+                    llm_calls=1,
+                    extra={"gaps_found": gaps_found},
+                ))
             elif action.type == "rewrite":
                 updates = await _execute_rewrite(state)
+                dt_ms = (time.monotonic() - t_action_start) * 1000
+                metrics_collector.record_action(ActionRecord(
+                    action_type="rewrite",
+                    step=state["step_count"],
+                    success=bool(updates),
+                    elapsed_ms=dt_ms,
+                    llm_calls=1,
+                    extra={"queries_generated": 3},
+                ))
             elif action.type == "answer":
                 # 生成答案 → 评估 → 决定是否继续
                 answer_state = await _execute_answer(state)
+                dt_ms_answer = (time.monotonic() - t_action_start) * 1000
                 state.update(answer_state)
 
                 if not state.get("final_answer"):
                     state["failed_attempts"] += 1
+                    metrics_collector.record_action(ActionRecord(
+                        action_type="answer",
+                        step=state["step_count"],
+                        success=False,
+                        elapsed_ms=dt_ms_answer,
+                        llm_calls=1,
+                        extra={"eval_passed": False, "eval_attempts": 0, "char_count": 0},
+                    ))
                     continue
 
                 # 评估答案
                 eval_passed = False
+                eval_total_attempts = 0
                 for eval_attempt in range(NUM_EVALS_REQUIRED):
                     answer_action = {"answer": state["final_answer"]}
                     eval_passed, improvement_plan = await eval_tool.evaluate_answer(
@@ -629,15 +722,32 @@ async def deep_research(
                         evaluation_types=state.get("evaluation_types", ["definitive"]),
                         all_knowledge=state["all_knowledge"],
                     )
+                    eval_total_attempts += 1
                     if eval_passed:
                         break
                     logger.info(f"  评估未通过，尝试 {eval_attempt+2}/{NUM_EVALS_REQUIRED+1}")
                     # 将改进方案存入 state，下一轮 answer 会使用
                     if improvement_plan:
                         state["last_improvement_plan"] = improvement_plan
+                    metrics_collector.mark_eval_failure()
                     # 重新生成答案
                     updates = await _execute_answer(state)
                     state.update(updates)
+
+                # 记录 answer 动作指标
+                metrics_collector.record_action(ActionRecord(
+                    action_type="answer",
+                    step=state["step_count"],
+                    success=eval_passed,
+                    elapsed_ms=dt_ms_answer,
+                    llm_calls=1 + eval_total_attempts,
+                    extra={
+                        "eval_passed": eval_passed,
+                        "eval_attempts": eval_total_attempts,
+                        "char_count": len(state.get("final_answer", "")),
+                        "eval_failed": not eval_passed and eval_total_attempts > 0,
+                    },
+                ))
 
                 if eval_passed:
                     break  # 通过评估，退出循环
@@ -646,7 +756,18 @@ async def deep_research(
                     state["diary_context"].append("[evaluate] 答案未通过评估，继续研究")
                     if state["failed_attempts"] >= MAX_FAILURES:
                         logger.warning(f"达到最大失败次数 {MAX_FAILURES}，触发 Beast Mode")
+                        t_bm = time.monotonic()
                         updates = await _execute_beast_mode(state)
+                        dt_bm = (time.monotonic() - t_bm) * 1000
+                        metrics_collector.mark_beast_mode(reason="max_failures")
+                        metrics_collector.record_action(ActionRecord(
+                            action_type="beast_mode",
+                            step=state["step_count"],
+                            success=bool(state.get("final_answer", "")),
+                            elapsed_ms=dt_bm,
+                            llm_calls=1,
+                            extra={"trigger_reason": "max_failures"},
+                        ))
                         state.update(updates)
                         break
                     continue
@@ -667,8 +788,28 @@ async def deep_research(
             logger.error(f"动作 {action.type} 执行失败: {e}")
             state["failed_attempts"] += 1
             state["diary_context"].append(f"[error] {action.type} 失败: {e}")
+            # 记录失败动作
+            metrics_collector.record_action(ActionRecord(
+                action_type=action.type,
+                step=state["step_count"],
+                success=False,
+                elapsed_ms=0,
+                llm_calls=0,
+                extra={"error": str(e), "llm_error": "LLM" in str(e) or "model" in str(e)},
+            ))
             if state["failed_attempts"] >= MAX_FAILURES:
+                t_bm = time.monotonic()
                 updates = await _execute_beast_mode(state)
+                dt_bm = (time.monotonic() - t_bm) * 1000
+                metrics_collector.mark_beast_mode(reason="max_failures")
+                metrics_collector.record_action(ActionRecord(
+                    action_type="beast_mode",
+                    step=state["step_count"],
+                    success=bool(state.get("final_answer", "")),
+                    elapsed_ms=dt_bm,
+                    llm_calls=1,
+                    extra={"trigger_reason": "max_failures"},
+                ))
                 state.update(updates)
                 break
 
@@ -678,7 +819,18 @@ async def deep_research(
     # 如果还没答案，Beast Mode
     if not state.get("final_answer"):
         logger.warning("循环结束但无答案，触发 Beast Mode")
+        t_bm = time.monotonic()
         updates = await _execute_beast_mode(state)
+        dt_bm = (time.monotonic() - t_bm) * 1000
+        metrics_collector.mark_beast_mode(reason="loop_exhausted")
+        metrics_collector.record_action(ActionRecord(
+            action_type="beast_mode",
+            step=state["step_count"],
+            success=bool(state.get("final_answer", "")),
+            elapsed_ms=dt_bm,
+            llm_calls=1,
+            extra={"trigger_reason": "loop_exhausted"},
+        ))
         state.update(updates)
 
     logger.info(f"✅ Deep Research 完成: {len(state['final_answer'])} 字符, "
@@ -686,7 +838,7 @@ async def deep_research(
 
     await _emit()
 
-    return {
+    result = {
         "answer": state["final_answer"],
         "references": state["references"],
         "diary": state["diary_context"],
@@ -694,3 +846,15 @@ async def deep_research(
         "steps": state["step_count"],
         "beast_mode_used": state["beast_mode_used"],
     }
+
+    # ── 持久化指标 ────────────────────────────────────────────
+    try:
+        task_metrics = metrics_collector.finalize()
+        # 用结果中的 task_id（如果有的话）
+        storage = MetricsStorage()
+        storage.save_task_metrics(task_metrics)
+        logger.info(f"[Metrics] 已保存任务指标: {task_metrics.task_id or '(id pending)'}")
+    except Exception as e:
+        logger.warning(f"[Metrics] 保存指标失败: {e}")
+
+    return result

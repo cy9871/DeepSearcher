@@ -57,3 +57,22 @@ export async function fetchProcessLog(taskId) {
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
+
+// ── 评估 API ──
+export async function fetchEvalSummary() {
+  const res = await fetch(`${API_BASE}/eval/summary`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function fetchEvalTask(taskId) {
+  const res = await fetch(`${API_BASE}/eval/task/${taskId}`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function fetchEvalTasks() {
+  const res = await fetch(`${API_BASE}/eval/tasks`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
