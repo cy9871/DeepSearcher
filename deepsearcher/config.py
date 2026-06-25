@@ -73,5 +73,18 @@ NUM_EVALS_REQUIRED = 1       # 答案评估重复轮次
 MAX_RETRIES = 3
 RETRY_DELAY = 1.0            # 秒
 
+# ── URL 过滤 ────────────────────────────────────────────────────
+# 已知垃圾站/短链接/广告域名，搜索结果直接跳过
+BAD_HOSTNAMES = [
+    # 广告/低质量内容农场
+    "adclick", "doubleclick", "adsense", "adservice",
+    # 短链接服务（无法判断内容质量）
+    "t.co", "bit.ly", "ow.ly", "tinyurl.com", "short.url",
+    # 搜索引擎自身
+    "google.com/search", "bing.com/search",
+]
+# 仅允许这些域名（白名单模式，为空则不限制）
+ONLY_HOSTNAMES: list[str] = []
+
 # ── 日志 ────────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"

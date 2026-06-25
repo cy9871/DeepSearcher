@@ -33,6 +33,8 @@ from .config import (
     NUM_EVALS_REQUIRED,
     MAX_RETRIES,
     RETRY_DELAY,
+    BAD_HOSTNAMES,
+    ONLY_HOSTNAMES,
 )
 from .models import (
     Action,
@@ -189,6 +191,33 @@ def _build_decision_context(state: dict) -> str:
 # 动作执行函数
 # ═══════════════════════════════════════════════════════════════════
 
+
+def _filter_urls(urls: dict[str, Snippet], visited: set[str], bad_hostnames: set[str]) -> dict[str, Snippet]:
+    """
+    门禁4: URL 过滤 — 去掉已访问的、坏域名的、白名单外的。
+    对应 node-DeepResearch 的 filterURLs()。
+    """
+    filtered: dict[str, Snippet] = {}
+    for url, snippet in urls.items():
+        # 已访问 → 跳过
+        if url in visited:
+            continue
+        # 坏域名 → 跳过
+        hostname = urlparse(url).hostname or ""
+        if any(bad in hostname for bad in bad_hostnames):
+            logger.debug(f"  🚫 过滤坏域名: {hostname}")
+            continue
+        # 白名单模式
+        if ONLY_HOSTNAMES and not any(allowed in hostname for allowed in ONLY_HOSTNAMES):
+            logger.debug(f"  🚫 不在白名单: {hostname}")
+            continue
+        filtered[url] = snippet
+    skipped = len(urls) - len(filtered)
+    if skipped:
+        logger.info(f"  URL 过滤: 跳过 {skipped} 个（已访问/坏域名/不在白名单）")
+    return filtered
+
+
 def _serp_cluster(urls: dict[str, Snippet], max_urls: int = 6, max_per_domain: int = 2) -> list[str]:
     """
     serpCluster: 将搜索结果按域名聚类，取各域名最有价值的 URL。
@@ -246,6 +275,14 @@ async def _execute_search(state: dict, queries: list[str]) -> dict:
                 new_urls[r.url] = snippet
 
     # ── serpCluster：按域名聚类，推入待读队列 ──
+    # ── 门禁4: URL 过滤（去已访问、坏域名、不在白名单）──
+    visited = set(state.get("visited_urls", []))
+    bad_set = set(BAD_HOSTNAMES)
+    new_urls = _filter_urls(new_urls, visited, bad_set)
+    if not new_urls:
+        logger.warning("  URL 过滤后无可用链接")
+        return {"all_urls": state["all_urls"]}
+
     clustered_urls = _serp_cluster(new_urls, max_urls=6, max_per_domain=2)
     existing_todo = set(state.get("urls_to_visit", []))
     visited = set(state.get("visited_urls", []))
@@ -574,6 +611,13 @@ async def deep_research(
         state["evaluation_types"] = q_eval.types
         state["diary_context"].append(f"[evaluate_question] 需要检查: {q_eval.types}")
         logger.info(f"  问题评估维度: {q_eval.types}")
+        # ── 时效性检测: freshness 问题第一步禁止 answer ──
+        if "freshness" in q_eval.types:
+            state["_freshness_detected"] = True
+            state["diary_context"].append(
+                "[⏰ freshness] 该问题对时效性敏感，第一步会强制搜索+读取最新信息"
+            )
+            logger.info("  ⏰ 时效性问题，禁止首轮 answer/reflect")
     except Exception as e:
         logger.warning(f"问题评估失败: {e}")
         state["evaluation_types"] = ["definitive"]
@@ -645,6 +689,24 @@ async def deep_research(
                 action.type = "visit"
                 state["diary_context"].append(f"[⛔ 硬拦截] 搜索刚完成，必须先读取正文再回答")
                 metrics_collector.mark_hard_intercept()
+
+        # ── 硬拦截3：时效性检测 → 前3轮禁止 answer/reflect ──
+        if state.get("_freshness_detected") and state["step_count"] <= 3:
+            if action.type == "answer":
+                logger.info(f"  ⏰ 时效性问题，前3轮禁止 answer，强制 visit")
+                action.type = "visit"
+                state["diary_context"].append(
+                    "[⏰ freshness] 时效性问题需先收集最新信息，禁止提前回答"
+                )
+                metrics_collector.mark_hard_intercept()
+            elif action.type == "reflect":
+                logger.info(f"  ⏰ 时效性问题，前3轮禁止 reflect，先搜+读")
+                action.type = "visit"
+                state["diary_context"].append(
+                    "[⏰ freshness] 时效性问题先搜+读最新信息，暂不反思"
+                )
+                metrics_collector.mark_hard_intercept()
+
         # 每轮后清除搜索标志（visit 后就可以 answer 了）
         if action.type != "search":
             state["_search_just_done"] = False
