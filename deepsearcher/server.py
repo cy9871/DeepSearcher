@@ -72,6 +72,7 @@ class SearchTask:
                 max_turns=self.max_turns,
                 token_budget=self.token_budget,
                 event_callback=on_event,
+                task_id=self.task_id,
             )
             self.result = result
             self.done = True
@@ -575,22 +576,131 @@ async def get_eval_text_report():
 
 @app.get("/api/eval/tasks")
 async def list_eval_tasks():
-    """列出所有已评估的任务"""
+    """列出所有任务（合并评估指标 + 历史结果）"""
     try:
         storage = MetricsStorage()
-        return storage.get_metrics_index()
+        metrics_index = storage.get_metrics_index()
+        metrics_ids = {e["task_id"] for e in metrics_index}
+
+        # 合并 results/index.json 中的历史任务
+        _ensure_results_dir()
+        results_index_path = os.path.join(RESULTS_DIR, "index.json")
+        if os.path.exists(results_index_path):
+            with open(results_index_path, "r", encoding="utf-8") as f:
+                results_index = json.load(f)
+        else:
+            results_index = []
+
+        merged = list(metrics_index)  # 指标任务优先
+        for entry in results_index:
+            tid = entry.get("task_id", "")
+            if tid and tid not in metrics_ids:
+                merged.append({
+                    "task_id": tid,
+                    "question": entry.get("question", "")[:60],
+                    "created_at": entry.get("timestamp", entry.get("created_at", 0)),
+                    "steps_taken": entry.get("steps", 0) if isinstance(entry.get("steps"), int) else 0,
+                    "completed": True,
+                    "eval_passed": False,
+                    "total_elapsed_ms": 0,
+                    "difficulty_label": "",
+                    "beast_mode_triggered": entry.get("beast_mode_used", False),
+                    "knowledge_count": entry.get("knowledge_count", 0),
+                    "ref_count": entry.get("ref_count", 0),
+                })
+
+        merged.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        return merged
     except Exception as e:
         raise HTTPException(500, f"任务列表获取失败: {e}")
 
 
 @app.get("/api/eval/task/{task_id}")
 async def get_eval_task(task_id: str):
-    """获取单个任务的详细指标"""
+    """获取单个任务的详细指标 + 答案 + 过程日志"""
     try:
         storage = MetricsStorage()
         metrics = storage.load_task_metrics(task_id)
+
+        # 从 results/ 读取答案和过程日志
+        _ensure_results_dir()
+        result_path = os.path.join(RESULTS_DIR, f"{task_id}.json")
+        rdata = None
+        question = ""
+        answer = ""
+        references = []
+        diary = []
+        knowledge_count = 0
+        beast_mode_used = False
+        if os.path.exists(result_path):
+            try:
+                with open(result_path, "r", encoding="utf-8") as f:
+                    rdata = json.load(f)
+            except Exception:
+                rdata = None
+        if rdata:
+            result = rdata.get("result") or {}
+            question = rdata.get("question", "") or ""
+            answer = result.get("answer", "") or ""
+            references = result.get("references", []) or []
+            diary = result.get("diary", []) or []
+            knowledge_count = result.get("knowledge_count", 0)
+            beast_mode_used = result.get("beast_mode_used", False)
+
+        # 过程日志
+        process_text = ""
+        process_path = os.path.join(RESULTS_DIR, f"{task_id}_过程日志.md")
+        if os.path.exists(process_path):
+            with open(process_path, "r", encoding="utf-8") as f:
+                process_text = f.read()
+        elif diary:
+            # 从结果文件构建
+            proc_lines = []
+            for entry in diary:
+                stripped = entry.strip()
+                if stripped.startswith("═══ 步骤"):
+                    proc_lines.append(f"\n**{stripped}**")
+                elif stripped:
+                    proc_lines.append(f"    {stripped}")
+            process_text = "\n".join(proc_lines)
+
+        # 尝试从 metrics 或 index.json 获取问题标题
+        if not question and metrics:
+            question = metrics.question or ""
+        if not question:
+            # 从 results/index.json 找
+            results_idx_path = os.path.join(RESULTS_DIR, "index.json")
+            if os.path.exists(results_idx_path):
+                try:
+                    with open(results_idx_path, "r", encoding="utf-8") as f:
+                        results_idx = json.load(f)
+                    for entry in results_idx:
+                        if entry.get("task_id") == task_id:
+                            question = entry.get("question", "") or ""
+                            break
+                except Exception:
+                    pass
+
         if not metrics:
-            raise HTTPException(404, f"任务 {task_id} 的指标不存在")
+            # 历史任务无指标数据，返回基本信息
+            return {
+                "data": {
+                    "task_id": task_id,
+                    "question": question,
+                    "completed": True,
+                    "steps_taken": len(diary) if diary else 0,
+                    "max_steps_allowed": 0,
+                    "total_elapsed_ms": 0,
+                    "answer": answer,
+                    "references": references,
+                    "knowledge_count": knowledge_count,
+                    "beast_mode_triggered": beast_mode_used,
+                    "process_log": process_text,
+                    "action_records": [],
+                    "has_metrics": False,
+                },
+            }
+
         reporter = MetricsReporter(storage)
         return {
             "text_report": reporter.format_task_text(metrics),
@@ -619,6 +729,11 @@ async def get_eval_task(task_id: str):
                 "llm_errors": metrics.llm_errors,
                 "created_at": metrics.created_at,
                 "difficulty_label": metrics.difficulty_label,
+                "answer": answer,
+                "references": references,
+                "knowledge_count": knowledge_count,
+                "process_log": process_text,
+                "has_metrics": True,
                 "action_records": [
                     {
                         "type": r.action_type,

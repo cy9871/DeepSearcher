@@ -193,9 +193,10 @@
                 <th class="text-left py-2 px-3 font-medium">任务 ID</th>
                 <th class="text-left py-2 px-3 font-medium hidden md:table-cell">问题</th>
                 <th class="text-center py-2 px-3 font-medium">步骤</th>
+                <th class="text-center py-2 px-3 font-medium">知识</th>
+                <th class="text-center py-2 px-3 font-medium">引用</th>
                 <th class="text-center py-2 px-3 font-medium">状态</th>
                 <th class="text-right py-2 px-3 font-medium">耗时</th>
-                <th class="text-center py-2 px-3 font-medium hidden md:table-cell">难度</th>
                 <th></th>
               </tr>
             </thead>
@@ -203,15 +204,15 @@
               <tr v-for="t in tasks" :key="t.task_id" class="hover:bg-zinc-50/60 transition-colors cursor-pointer" @click="selectedTask = t.task_id; loadTaskDetail(t.task_id)">
                 <td class="py-2 px-3 font-mono text-zinc-600 truncate max-w-[100px]">{{ t.task_id.slice(0, 12) }}...</td>
                 <td class="py-2 px-3 text-zinc-700 truncate max-w-[200px] hidden md:table-cell">{{ t.question }}</td>
-                <td class="py-2 px-3 text-center text-zinc-600">{{ t.steps_taken }}</td>
+                <td class="py-2 px-3 text-center text-zinc-600">{{ t.steps_taken || '?' }}</td>
+                <td class="py-2 px-3 text-center text-zinc-600">{{ t.knowledge_count ?? '—' }}</td>
+                <td class="py-2 px-3 text-center text-zinc-600">{{ t.ref_count ?? '—' }}</td>
                 <td class="py-2 px-3 text-center">
                   <span v-if="t.completed" class="text-emerald-600">✅</span>
-                  <span v-else class="text-rose-500">❌</span>
+                  <span v-else-if="t.completed === false" class="text-rose-500">❌</span>
+                  <span v-else class="text-zinc-300">—</span>
                 </td>
                 <td class="py-2 px-3 text-right text-zinc-500 font-mono">{{ fmtMs(t.total_elapsed_ms) }}</td>
-                <td class="py-2 px-3 text-center hidden md:table-cell">
-                  <span :class="diffTagClass(t.difficulty_label)">{{ t.difficulty_label || '—' }}</span>
-                </td>
                 <td class="py-2 px-3 text-right">
                   <span class="text-zinc-300 hover:text-zinc-500 text-xs">详情 →</span>
                 </td>
@@ -221,37 +222,102 @@
         </div>
       </section>
 
-      <!-- 任务详情弹窗 -->
+      <!-- 任务详情弹窗 — 三标签：指标 / 答案 / 过程日志 -->
       <Teleport to="body">
-        <div v-if="taskDetail" class="fixed inset-0 z-50 flex items-start justify-center pt-20 bg-black/30" @click.self="taskDetail = null">
-          <div class="bg-white rounded-2xl shadow-2xl border border-zinc-200 max-w-lg w-full mx-4 max-h-[72vh] overflow-y-auto">
-            <div class="sticky top-0 bg-white border-b border-zinc-100 p-4 flex items-center justify-between rounded-t-2xl">
-              <h3 class="text-sm font-semibold text-zinc-800">📋 任务详情</h3>
-              <button @click="taskDetail = null" class="text-zinc-400 hover:text-zinc-600 transition text-lg leading-none">&times;</button>
-            </div>
-            <div class="p-4 space-y-3">
-              <div class="text-sm text-zinc-700 font-medium">{{ taskDetail.question }}</div>
-              <div class="grid grid-cols-2 gap-2 text-xs">
-                <div class="px-2 py-1 bg-zinc-50 rounded"><span class="text-zinc-400">步骤</span> <span class="text-zinc-700 ml-1">{{ taskDetail.steps_taken }}/{{ taskDetail.max_steps_allowed }}</span></div>
-                <div class="px-2 py-1 bg-zinc-50 rounded"><span class="text-zinc-400">耗时</span> <span class="text-zinc-700 ml-1">{{ fmtMs(taskDetail.total_elapsed_ms) }}</span></div>
-                <div class="px-2 py-1 bg-zinc-50 rounded"><span class="text-zinc-400">LLM调用</span> <span class="text-zinc-700 ml-1">{{ taskDetail.llm_total_calls }} 次</span></div>
-                <div class="px-2 py-1 bg-zinc-50 rounded"><span class="text-zinc-400">Token</span> <span class="text-zinc-700 ml-1">{{ (taskDetail.llm_total_tokens || 0).toLocaleString() }}</span></div>
-              </div>
-              <!-- 动作明细 -->
-              <div class="text-xs text-zinc-400 font-medium">动作明细</div>
-              <div class="space-y-1">
-                <div v-for="(r, i) in taskDetail.action_records" :key="i" class="flex items-center gap-2 text-xs py-1 px-2 rounded hover:bg-zinc-50">
-                  <span>{{ r.success ? '✅' : '❌' }}</span>
-                  <span class="text-zinc-400">step{{ r.step }}</span>
-                  <span class="font-mono text-zinc-600 w-14">{{ r.type }}</span>
-                  <span class="text-zinc-400 font-mono ml-auto">{{ fmtMs(r.elapsed_ms) }}</span>
-                  <span v-if="r.extra" class="text-zinc-300 ml-2 truncate max-w-[140px]">{{ extraSummary(r) }}</span>
+        <div v-if="taskDetail" class="fixed inset-0 z-50 flex items-start justify-center pt-16 bg-black/30" @click.self="taskDetail = null">
+          <div class="bg-white rounded-2xl shadow-2xl border border-zinc-200 max-w-3xl w-full mx-4 max-h-[80vh] flex flex-col">
+            <!-- 标题栏 -->
+            <div class="shrink-0 border-b border-zinc-100 p-4 flex items-center justify-between">
+              <div class="flex-1 min-w-0">
+                <h3 class="text-sm font-semibold text-zinc-800 truncate">{{ taskDetail.question }}</h3>
+                <div class="flex gap-3 mt-1 text-xs text-zinc-400">
+                  <span>ID: {{ taskDetail.task_id?.slice(0,12) }}</span>
+                  <span>{{ taskDetail.steps_taken || '?' }} 步</span>
+                  <span v-if="taskDetail.total_elapsed_ms">{{ fmtMs(taskDetail.total_elapsed_ms) }}</span>
+                  <span v-if="taskDetail.knowledge_count != null">{{ taskDetail.knowledge_count }} 条知识</span>
+                  <span v-if="taskDetail.references?.length">{{ taskDetail.references.length }} 引用</span>
+                  <span v-if="taskDetail.beast_mode_triggered" class="text-amber-500">⚡Beast</span>
                 </div>
               </div>
-              <!-- 异常 -->
-              <div v-if="anomalyList.length" class="text-xs text-zinc-400">
-                <span class="font-medium">异常:</span>
-                <span v-for="a in anomalyList" :key="a" class="ml-2 px-1.5 py-0.5 bg-rose-50 text-rose-600 rounded">{{ a }}</span>
+              <button @click="taskDetail = null" class="text-zinc-400 hover:text-zinc-600 transition text-xl leading-none ml-4">&times;</button>
+            </div>
+            <!-- 标签切换 -->
+            <div class="shrink-0 flex border-b border-zinc-100 px-4">
+              <button v-for="tab in tabs" :key="tab.key"
+                @click="activeTab = tab.key"
+                :class="[
+                  'px-4 py-2 text-xs font-medium transition border-b-2 -mb-[1px]',
+                  activeTab === tab.key
+                    ? 'text-zinc-800 border-zinc-800'
+                    : 'text-zinc-400 border-transparent hover:text-zinc-600'
+                ]">
+                {{ tab.label }}
+              </button>
+            </div>
+            <!-- 标签内容（可滚动） -->
+            <div class="flex-1 overflow-y-auto p-4">
+              <!-- Tab 1: 指标 -->
+              <div v-if="activeTab === 'metrics'">
+                <div v-if="!taskDetail.has_metrics" class="text-center py-10 text-zinc-400">
+                  <p class="text-sm">📊 该任务没有指标数据</p>
+                  <p class="text-xs mt-2">指标采集器是后来加的，历史任务不会自动补指标。</p>
+                </div>
+                <div v-else class="space-y-4">
+                  <!-- 概览 -->
+                  <div class="grid grid-cols-4 gap-2 text-xs">
+                    <div class="px-2 py-1.5 bg-zinc-50 rounded"><span class="text-zinc-400">步骤</span> <span class="text-zinc-700 ml-1 font-mono">{{ taskDetail.steps_taken }}/{{ taskDetail.max_steps_allowed }}</span></div>
+                    <div class="px-2 py-1.5 bg-zinc-50 rounded"><span class="text-zinc-400">耗时</span> <span class="text-zinc-700 ml-1 font-mono">{{ fmtMs(taskDetail.total_elapsed_ms) }}</span></div>
+                    <div class="px-2 py-1.5 bg-zinc-50 rounded"><span class="text-zinc-400">LLM调用</span> <span class="text-zinc-700 ml-1 font-mono">{{ taskDetail.llm_total_calls }} 次</span></div>
+                    <div class="px-2 py-1.5 bg-zinc-50 rounded"><span class="text-zinc-400">Token</span> <span class="text-zinc-700 ml-1 font-mono">{{ (taskDetail.llm_total_tokens || 0).toLocaleString() }}</span></div>
+                    <div class="px-2 py-1.5 bg-zinc-50 rounded"><span class="text-zinc-400">门禁</span> <span class="text-zinc-700 ml-1">{{ taskDetail.eval_passed ? '✅ 通过' : '❌ 未过' }}</span></div>
+                    <div class="px-2 py-1.5 bg-zinc-50 rounded"><span class="text-zinc-400">失败</span> <span class="text-zinc-700 ml-1 font-mono">{{ taskDetail.failed_actions }}</span></div>
+                    <div class="px-2 py-1.5 bg-zinc-50 rounded"><span class="text-zinc-400">难度</span> <span :class="diffTagClass(taskDetail.difficulty_label)" class="ml-1">{{ taskDetail.difficulty_label || '—' }}</span></div>
+                    <div class="px-2 py-1.5 bg-zinc-50 rounded"><span class="text-zinc-400">异常</span> <span class="text-zinc-700 ml-1 font-mono">{{ anomalyCount }}</span></div>
+                  </div>
+                  <!-- 动作明细 -->
+                  <div v-if="taskDetail.action_records?.length">
+                    <div class="text-xs text-zinc-400 font-medium mb-2">动作明细</div>
+                    <div class="space-y-1 max-h-52 overflow-y-auto">
+                      <div v-for="(r, i) in taskDetail.action_records" :key="i" class="flex items-center gap-2 text-xs py-1 px-2 rounded hover:bg-zinc-50">
+                        <span>{{ r.success ? '✅' : '❌' }}</span>
+                        <span class="text-zinc-400">step{{ r.step }}</span>
+                        <span class="font-mono text-zinc-600 w-16">{{ r.type }}</span>
+                        <span class="text-zinc-400 font-mono ml-auto">{{ fmtMs(r.elapsed_ms) }}</span>
+                        <span v-if="extraSummary(r)" class="text-zinc-300 ml-2 truncate max-w-[160px]">{{ extraSummary(r) }}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <!-- 异常项 -->
+                  <div v-if="anomalyList.length" class="text-xs">
+                    <span class="text-zinc-400 font-medium">异常:</span>
+                    <span v-for="a in anomalyList" :key="a" class="ml-2 px-1.5 py-0.5 bg-rose-50 text-rose-600 rounded">{{ a }}</span>
+                  </div>
+                </div>
+              </div>
+              <!-- Tab 2: 答案 -->
+              <div v-if="activeTab === 'answer'">
+                <div v-if="!taskDetail.answer" class="text-center py-10 text-zinc-400">
+                  <p class="text-sm">📝 无答案内容</p>
+                </div>
+                <div v-else>
+                  <div class="prose prose-sm max-w-none text-zinc-700 whitespace-pre-wrap leading-relaxed" v-html="renderedAnswer"></div>
+                  <!-- 引用 -->
+                  <div v-if="taskDetail.references?.length" class="mt-6 pt-4 border-t border-zinc-100">
+                    <div class="text-xs text-zinc-400 font-medium mb-2">📎 引用来源 ({{ taskDetail.references.length }})</div>
+                    <div class="space-y-1">
+                      <div v-for="(ref, i) in taskDetail.references" :key="i" class="text-xs text-zinc-500 break-all">
+                        <a :href="ref" target="_blank" class="text-blue-500 hover:underline">[{{ i+1 }}] {{ ref }}</a>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <!-- Tab 3: 过程日志 -->
+              <div v-if="activeTab === 'log'">
+                <div v-if="!taskDetail.process_log" class="text-center py-10 text-zinc-400">
+                  <p class="text-sm">📋 无过程日志</p>
+                </div>
+                <pre class="text-xs text-zinc-600 whitespace-pre-wrap leading-relaxed font-mono bg-zinc-50 rounded-lg p-4 max-h-[50vh] overflow-y-auto">{{ taskDetail.process_log }}</pre>
               </div>
             </div>
           </div>
@@ -264,6 +330,7 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import { marked } from 'marked'
 import { fetchEvalSummary, fetchEvalTask, fetchEvalTasks } from '../api/search.js'
 
 const loading = ref(true)
@@ -271,6 +338,24 @@ const summary = ref(null)
 const tasks = ref([])
 const taskDetail = ref(null)
 const selectedTask = ref('')
+const activeTab = ref('answer')  // 默认打开答案 tab
+const tabs = [
+  { key: 'answer', label: '📝 答案' },
+  { key: 'metrics', label: '📊 指标' },
+  { key: 'log', label: '📋 过程日志' },
+]
+
+function simpleMarkdown(text) {
+  if (!text) return ''
+  try {
+    return marked.parse(text)
+  } catch {
+    // marked 可能未安装，回退到纯文本
+    return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/\n/g,'<br>')
+      .replace(/###? ([^\n]+)/g,'<strong>$1</strong>')
+  }
+}
 
 // 加载聚合摘要
 async function loadSummary() {
@@ -320,6 +405,12 @@ const anomalyList = computed(() => {
   if (d.llm_errors) list.push(`LLM错误×${d.llm_errors}`)
   return list
 })
+const anomalyCount = computed(() => {
+  const d = taskDetail.value
+  if (!d) return 0
+  return (d.empty_searches||0) + (d.empty_visits||0) + (d.evaluation_failures||0) + (d.hard_intercepts||0) + (d.llm_errors||0)
+})
+const renderedAnswer = computed(() => simpleMarkdown(taskDetail.value?.answer || ''))
 
 // 动作分布按指定顺序排列（补零）
 const paddedActionDist = computed(() => {

@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import Literal
 
 from .config import (
@@ -486,6 +487,7 @@ async def deep_research(
     max_turns: int = MAX_TURNS,
     token_budget: int = TOKEN_BUDGET,
     event_callback=None,
+    task_id: str = "",
 ) -> dict:
     """
     深度研究 Agent 主入口。
@@ -506,8 +508,10 @@ async def deep_research(
     logger.info(f"   budget={token_budget}, max_turns={max_turns}")
 
     # ── 指标采集器 ────────────────────────────────────────────
+    if not task_id:
+        task_id = uuid.uuid4().hex[:12]
     metrics_collector = MetricsCollector(
-        task_id="",  # 将在结果返回前填入
+        task_id=task_id,
         question=question,
         max_turns=max_turns,
         token_budget=token_budget,

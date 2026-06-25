@@ -1,7 +1,7 @@
 """
 Deep Research Agent 配置
 
-LLM 层走 QClaw 内部网关（localhost:57036，OpenAI 兼容格式）。
+LLM 层走 QClaw 内部网关（自动探测端口，OpenAI 兼容格式）。
 自动读取网关 token，也可通过环境变量覆盖。
 """
 
@@ -22,9 +22,30 @@ def _get_gateway_token() -> str:
         return ""
 
 
+def _get_gateway_base_url() -> str:
+    """从 OpenClaw 配置文件自动读取 gateway 端口，构造 base_url。
+    优先用环境变量 DEEPSEARCH_BASE_URL，其次从 openclaw.json 自动探测。
+    这样 gateway 改端口后无需手动改配置。
+    """
+    env_url = os.environ.get("DEEPSEARCH_BASE_URL", "")
+    if env_url:
+        return env_url
+    try:
+        config_path = os.path.expanduser("~/.qclaw/openclaw.json")
+        with open(config_path) as f:
+            cfg = json.load(f)
+        gw = cfg.get("gateway", {})
+        port = gw.get("port", 62258)
+        bind = gw.get("bind", "loopback")
+        host = "127.0.0.1" if bind == "loopback" else "localhost"
+        return f"http://{host}:{port}/v1"
+    except Exception:
+        return "http://localhost:62258/v1"
+
+
 # ── LLM 配置（走 QClaw 内部网关）────────────────────────────────
 LLM_CONFIG = {
-    "base_url": os.environ.get("DEEPSEARCH_BASE_URL", "http://localhost:57036/v1"),
+    "base_url": _get_gateway_base_url(),
     "api_key": _get_gateway_token(),
     "model": os.environ.get("DEEPSEARCH_MODEL", "openclaw"),
     "temperature": 0.1,
