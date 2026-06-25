@@ -354,9 +354,15 @@ async def _execute_rewrite(state: dict) -> dict:
         return await _execute_search(state, state["gaps"][:2])
 
     try:
+        # 提取已覆盖的子问题标题（每个 KnowledgeItem.question），只传标题不传正文
+        all_knowledge = state.get("all_knowledge", [])
+        covered_topics = [k.question for k in all_knowledge[-10:]] if all_knowledge else []
+
         new_queries = await rewrite_tool.rewrite_queries(
             question=state["question"],
             existing_results=raw_results,
+            gaps=state.get("gaps", []),
+            covered_topics=covered_topics,
             num_queries=3,
         )
         diary = [f"[rewrite] 改写查询: {', '.join(new_queries[:3])}"]

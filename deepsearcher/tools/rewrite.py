@@ -1,6 +1,6 @@
 """查询改写工具
 
-基于已有搜索结果，改写搜索查询词以提高召回率。
+基于已有搜索结果 + 反思缺口 + 已覆盖方向，改写搜索查询词以提高召回率。
 对应 node-DeepResearch 的 query-rewriter.ts。
 """
 
@@ -16,14 +16,16 @@ logger = logging.getLogger(__name__)
 
 
 REWRITE_SYSTEM = """你是一个搜索查询优化器。
-根据原始问题和已有搜索结果，生成改写后的搜索查询词以覆盖信息盲区。
+根据原始问题、已有搜索结果、已覆盖方向和知识缺口，生成改写后的搜索查询词。
 
 <rules>
 1. 每个查询词聚焦不同角度，避免搜索到相同内容
 2. 如果已有结果覆盖充分，返回已覆盖的查询
 3. 使用不同的措辞、同义词、相关术语
 4. 英文查询配合英文术语，中文查询保持中文
-5. 只输出 JSON，不要任何其他文字
+5. 不要改写已覆盖方向的查询词 —— 那些方向不用再搜
+6. 重点围绕知识缺口设计查询词
+7. 只输出 JSON，不要任何其他文字
 </rules>
 
 输出格式：
@@ -34,9 +36,19 @@ REWRITE_SYSTEM = """你是一个搜索查询优化器。
 async def rewrite_queries(
     question: str,
     existing_results: list[SearchResult],
+    gaps: list[str] | None = None,
+    covered_topics: list[str] | None = None,
     num_queries: int = 3,
 ) -> list[str]:
-    """基于已有结果改写查询词"""
+    """基于已有结果 + 反思缺口 + 已覆盖方向改写查询词
+
+    Args:
+        question: 原始问题
+        existing_results: 前几轮搜索的原始结果（标题+snippet），只取前10条
+        gaps: reflect 阶段发现的知识缺口
+        covered_topics: 已经收集充分的方向/子问题（仅标题，不传正文）
+        num_queries: 生成查询词数量
+    """
     client = get_client()
 
     # 构建已有结果摘要
@@ -44,12 +56,25 @@ async def rewrite_queries(
     for i, r in enumerate(existing_results[:10], 1):
         existing_summary += f"{i}. {r.title}: {r.snippet[:150]}\n"
 
+    # 已覆盖方向（避免重复改写）
+    covered_section = ""
+    if covered_topics:
+        covered_section = "\n以下方向已收集充分，不要再改写这些方向的查询词:\n"
+        for i, t in enumerate(covered_topics[:5], 1):
+            covered_section += f"{i}. {t}\n"
+
+    # 构建缺口信息（来自反思阶段）
+    gaps_section = ""
+    if gaps:
+        gaps_section = "\nreflect 发现的知识缺口，请围绕这些方向改写查询词:\n"
+        for i, g in enumerate(gaps[:3], 1):
+            gaps_section += f"{i}. {g}\n"
+
     prompt = f"""(系统指令){REWRITE_SYSTEM}
 
 (输入)原始问题: {question}
 
-{existing_summary}
-
+{existing_summary}{covered_section}{gaps_section}
 请生成 {num_queries} 个改写后的搜索查询词，覆盖信息盲区。
 """
 
