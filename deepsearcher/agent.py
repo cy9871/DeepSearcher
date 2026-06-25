@@ -80,6 +80,7 @@ DECIDE_SYSTEM = """你是研究 Agent 的决策器。
 == 硬约束 ==
 - 待读 URL > 1 时，只能 visit，严禁 answer
 - 步骤 < 3 时，只能 visit 或 search，严禁 answer
+- 搜索后绝不能直接 answer，必须先读取搜索结果的正文
 - 已有搜索结果但知识不足时，优先用 rewrite 改进搜索词
 
 == 输出规则 ==
@@ -211,7 +212,19 @@ def _serp_cluster(urls: dict[str, Snippet], max_urls: int = 6, max_per_domain: i
 
 async def _execute_search(state: dict, queries: list[str]) -> dict:
     """执行搜索，自动 serpCluster 后把高价值 URL 推入待读队列"""
-    results_by_query = await search_tool.multi_search(queries)
+    # ── 门禁1: 查询去重 ──
+    all_keywords = set(state.get("all_keywords", []))
+    deduped_queries = [q for q in queries if q not in all_keywords]
+    skipped = len(queries) - len(deduped_queries)
+    if skipped:
+        logger.info(f"  查询去重: 跳过 {skipped} 个已搜过的词")
+    if not deduped_queries:
+        logger.warning("  所有查询词均已搜索过，跳过搜索")
+        return {}
+    # 记录本次搜索词
+    state["all_keywords"].extend(deduped_queries)
+
+    results_by_query = await search_tool.multi_search(deduped_queries)
 
     # ── 积累原始搜索结果（供 rewrite 使用）──
     all_raw = []
@@ -534,6 +547,8 @@ async def deep_research(
         "weighted_urls": [],
         "diary_context": [],
         "raw_search_results": [],
+        "all_keywords": [],       # 已搜索过的所有查询词（去重用）
+        "_search_just_done": False,  # 搜索后锁定 answer（先 visit 再答）
         "last_improvement_plan": "",
         "step_count": 0,
         "token_budget": token_budget,
@@ -612,7 +627,7 @@ async def deep_research(
         action = await _decide_action(state)
         state["current_action"] = action.type
 
-        # ── 硬拦截：待读 URL > 0 且步骤 < 最大步数时，禁止 answer ──
+        # ── 硬拦截1：待读 URL > 0 且步骤 < 最大步数时，禁止 answer ──
         todo = state.get("urls_to_visit", [])
         visited = set(state.get("visited_urls", []))
         unvisited_count = len([u for u in todo if u not in visited])
@@ -622,11 +637,25 @@ async def deep_research(
             state["diary_context"].append(f"[⛔ 硬拦截] 待读队列还有 {unvisited_count} 个 URL，禁止提前 answer")
             metrics_collector.mark_hard_intercept()
 
+        # ── 硬拦截2：搜索后禁止立即 answer，必须先 visit 搜索结果 ──
+        if action.type == "answer" and state.get("_search_just_done"):
+            todo_now = state.get("urls_to_visit", [])
+            if todo_now and state["step_count"] < max_turns - 1:
+                logger.info(f"  ⛔ 硬拦截：搜索后禁止直接 answer，强制 visit")
+                action.type = "visit"
+                state["diary_context"].append(f"[⛔ 硬拦截] 搜索刚完成，必须先读取正文再回答")
+                metrics_collector.mark_hard_intercept()
+        # 每轮后清除搜索标志（visit 后就可以 answer 了）
+        if action.type != "search":
+            state["_search_just_done"] = False
+
         # 执行动作
         try:
             t_action_start = time.monotonic()
             if action.type == "search":
                 updates = await _execute_search(state, action.search_queries or state["gaps"][:2])
+                # 搜索后锁定 answer（下一轮必须先 visit 结果）
+                state["_search_just_done"] = True
                 dt_ms = (time.monotonic() - t_action_start) * 1000
                 # 计算搜索效果
                 all_new_urls = updates.get("all_urls", {})
@@ -764,6 +793,15 @@ async def deep_research(
                 else:
                     state["failed_attempts"] += 1
                     state["diary_context"].append("[evaluate] 答案未通过评估，继续研究")
+                    # ── 失败反馈环：将评估失败原因存为知识，指导后续迭代 ──
+                    last_plan = state.get("last_improvement_plan", "")
+                    if last_plan:
+                        state["all_knowledge"].append(KnowledgeItem(
+                            question=f"为什么以下答案对问题 '{question}' 不够好？需要改进什么？",
+                            answer=last_plan,
+                            references=[],
+                        ))
+                        logger.info(f"  📝 失败反馈已存入知识库 ({len(state['all_knowledge'])} 条)")
                     if state["failed_attempts"] >= MAX_FAILURES:
                         logger.warning(f"达到最大失败次数 {MAX_FAILURES}，触发 Beast Mode")
                         t_bm = time.monotonic()
