@@ -46,24 +46,61 @@ cd vue && npm install && npm run build && cd ..
 
 ## 配置
 
-编辑 `deepsearcher/config.py` 或设置环境变量：
+DeepSearcher 默认使用 OpenAI 协议，通过**四级优先级**自动解析配置：
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `DEEPSEARCH_BASE_URL` | `http://localhost:56685/v1` | LLM 接口地址，兼容 OpenAI 格式 |
-| `DEEPSEARCH_API_KEY` | *(内置)* | 替换为你自己的 key |
-| `DEEPSEARCH_MODEL` | `openclaw` | 模型名 |
-| `JINA_API_KEY` | *(空)* | 可选，启用 Jina Search |
-| `MAX_TURNS` | 20 | 最大搜索循环轮数 |
-| `TOKEN_BUDGET` | 100000 | 总 Token 预算 |
+| 优先级 | 方式 | 说明 |
+|--------|------|------|
+| 1 | `DEEPSEARCH_*` 环境变量 | 直接覆盖，优先级最高 |
+| 2 | `local_config.json` | 项目根目录，gitignore 不提交 |
+| 3 | `OPENAI_*` 标准环境变量 | 兼容 OpenAI SDK 习惯 |
+| 4 | 默认值 | `https://api.openai.com/v1` / `gpt-4o` |
 
-默认走本地 LLM 网关。改用 OpenAI 直连：
+### 方式一：用 OpenAI（零配置）
+
+只需要设置标准环境变量：
 
 ```bash
-export DEEPSEARCH_BASE_URL="https://api.openai.com/v1"
-export DEEPSEARCH_API_KEY="sk-..."
-export DEEPSEARCH_MODEL="gpt-4o"
+export OPENAI_API_KEY="sk-..."
 ```
+
+如果需要自定义 base_url 或模型：
+
+```bash
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_MODEL="gpt-4o"        # 可选，默认 gpt-4o
+```
+
+### 方式二：用自己的网关（local_config.json）
+
+复制模板文件并修改：
+
+```bash
+cp local_config.json.example local_config.json
+# 编辑 local_config.json，改成自己的地址和模型
+```
+
+```json
+{
+  "base_url": "http://localhost:8080/v1",
+  "api_key": "sk-***",
+  "model": "gpt-4o"
+}
+```
+
+`local_config.json` 已加入 `.gitignore`，不会泄露到仓库。
+
+### 环境变量参考
+
+| 变量 | 说明 |
+|------|------|
+| `OPENAI_API_KEY` | API 密钥 |
+| `OPENAI_BASE_URL` | API 地址，兼容 OpenAI 格式 |
+| `DEEPSEARCH_API_KEY` | 覆盖 OPENAI_API_KEY |
+| `DEEPSEARCH_BASE_URL` | 覆盖 OPENAI_BASE_URL |
+| `DEEPSEARCH_MODEL` | 模型名，默认 `gpt-4o` |
+| `JINA_API_KEY` | 可选，启用 Jina Search |
+| `MAX_TURNS` | 最大搜索循环轮数，默认 20 |
+| `TOKEN_BUDGET` | 总 Token 预算，默认 100000 |
 
 ---
 

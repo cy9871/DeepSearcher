@@ -59,24 +59,61 @@ cd vue && npm install && npm run build && cd ..
 
 ## Configuration
 
-Copy and edit `deepsearcher/config.py`, or set environment variables:
+DeepSearcher resolves LLM settings through a **4-level priority chain**:
 
-| Variable | Default | Notes |
-|----------|---------|-------|
-| `DEEPSEARCH_BASE_URL` | `http://localhost:56685/v1` | Any OpenAI-compatible API |
-| `DEEPSEARCH_API_KEY` | *(built-in)* | Replace with yours |
-| `DEEPSEARCH_MODEL` | `openclaw` | Model name |
-| `JINA_API_KEY` | *(empty)* | Optional — enables Jina Search |
-| `MAX_TURNS` | 20 | Max research loop iterations |
-| `TOKEN_BUDGET` | 100000 | Total token budget |
+| Priority | Method | Notes |
+|----------|--------|-------|
+| 1 | `DEEPSEARCH_*` env vars | Direct override, highest priority |
+| 2 | `local_config.json` | Project root, gitignored |
+| 3 | `OPENAI_*` standard env vars | Compatible with OpenAI SDK conventions |
+| 4 | Defaults | `https://api.openai.com/v1` / `gpt-4o` |
 
-DeepSearcher defaults to a local LLM gateway. To use OpenAI directly:
+### Option A: OpenAI (zero config)
+
+Just set the standard env var:
 
 ```bash
-export DEEPSEARCH_BASE_URL="https://api.openai.com/v1"
-export DEEPSEARCH_API_KEY="sk-..."
-export DEEPSEARCH_MODEL="gpt-4o"
+export OPENAI_API_KEY="sk-..."
 ```
+
+To override base URL or model:
+
+```bash
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_MODEL="gpt-4o"        # optional, default gpt-4o
+```
+
+### Option B: Your own gateway (local_config.json)
+
+Copy the template and edit:
+
+```bash
+cp local_config.json.example local_config.json
+# edit local_config.json with your endpoint
+```
+
+```json
+{
+  "base_url": "http://localhost:8080/v1",
+  "api_key": "sk-***",
+  "model": "gpt-4o"
+}
+```
+
+`local_config.json` is in `.gitignore` — it won't leak to the repo.
+
+### Environment Variables Reference
+
+| Variable | Notes |
+|----------|-------|
+| `OPENAI_API_KEY` | API key |
+| `OPENAI_BASE_URL` | Any OpenAI-compatible API endpoint |
+| `DEEPSEARCH_API_KEY` | Overrides `OPENAI_API_KEY` |
+| `DEEPSEARCH_BASE_URL` | Overrides `OPENAI_BASE_URL` |
+| `DEEPSEARCH_MODEL` | Model name, default `gpt-4o` |
+| `JINA_API_KEY` | Optional — enables Jina Search |
+| `MAX_TURNS` | Max loop iterations, default 20 |
+| `TOKEN_BUDGET` | Total token budget, default 100000 |
 
 ---
 

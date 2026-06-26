@@ -1,48 +1,29 @@
 """
 Deep Research Agent 配置
 
-LLM 层走 QClaw 内部网关（自动探测端口和 token，OpenAI 兼容格式）。
-探测逻辑与 RAGine 完全对齐：单一 _detect_gateway() → (port, token)。
-可通过环境变量覆盖。
+LLM 配置由 llm_adapter 统一管理（四级优先级）：
+  1. DEEPSEARCH_* 环境变量
+  2. 项目根目录 local_config.json
+  3. OPENAI_BASE_URL / OPENAI_API_KEY 标准环境变量
+  4. 默认值 → https://api.openai.com/v1, model=gpt-4o
 """
 
-import json
 import os
-from pathlib import Path
 
+from .llm_adapter import resolve_config
 
-def _detect_gateway() -> tuple[int, str]:
-    """Auto-detect QClaw gateway port and auth token from openclaw.json.
+# ── LLM 配置（通过适配器延迟解析）────────────────────────────────
+def _build_llm_config() -> dict:
+    cfg = resolve_config()
+    return {
+        "base_url": cfg["base_url"],
+        "api_key": cfg["api_key"],
+        "model": cfg["model"],
+        "temperature": 0.1,
+        "max_tokens": 4096,
+    }
 
-    Returns (port, token). Falls back to (62258, "") if config file not found.
-    Identical to RAGine ragine/config.py to keep both projects in sync.
-    """
-    config_paths = [
-        Path(os.environ.get("OPENCLAW_CONFIG_PATH", "")) if os.environ.get("OPENCLAW_CONFIG_PATH") else None,
-        Path.home() / ".qclaw" / "openclaw.json",
-    ]
-    for cp in config_paths:
-        if cp and cp.exists():
-            try:
-                cfg = json.loads(cp.read_text())
-                port = int(cfg.get("gateway", {}).get("port", 62258))
-                token = cfg.get("gateway", {}).get("auth", {}).get("token", "")
-                return (port, token)
-            except (json.JSONDecodeError, KeyError, IOError, ValueError):
-                continue
-    return (62258, "")
-
-
-_gw_port, _gw_token = _detect_gateway()
-
-# ── LLM 配置（走 QClaw 内部网关）────────────────────────────────
-LLM_CONFIG = {
-    "base_url": os.environ.get("DEEPSEARCH_BASE_URL") or f"http://127.0.0.1:{_gw_port}/v1",
-    "api_key": os.environ.get("DEEPSEARCH_API_KEY") or _gw_token or "sk-local",
-    "model": os.environ.get("DEEPSEARCH_MODEL", "openclaw"),
-    "temperature": 0.1,
-    "max_tokens": 4096,
-}
+LLM_CONFIG = _build_llm_config()
 
 # ── 搜索配置 ────────────────────────────────────────────────────
 # DuckDuckGo（免费，默认）
