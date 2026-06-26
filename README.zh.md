@@ -25,14 +25,17 @@ DeepSearcher 做了三件事来解决这个问题：
 # 环境
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 
 # CLI 模式
-python -m deepsearcher "固态电池的最新突破有哪些"
-python -m deepsearcher "解释一下 Transformer 的注意力机制" --max-turns 15
+deepsearcher "固态电池的最新突破有哪些"
+deepsearcher "解释一下 Transformer 的注意力机制" --max-turns 15
+
+# 或者 python -m deepsearcher "..." （同上）
 
 # Web 界面
-python -m deepsearcher.server
+deepsearcher server
+# 或者 python -m deepsearcher.server
 # → http://localhost:8080
 ```
 

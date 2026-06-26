@@ -39,13 +39,16 @@ No fancy diagrams. Just a state machine with five tools and six exit checks.
 # Setup
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 
 # CLI
-python -m deepsearcher "What are the latest breakthroughs in solid-state batteries?"
+deepsearcher "What are the latest breakthroughs in solid-state batteries?"
+
+# Or: python -m deepsearcher "..."
 
 # Web UI
-python -m deepsearcher.server
+deepsearcher server
+# Or: python -m deepsearcher.server
 # → http://localhost:8080
 ```
 
