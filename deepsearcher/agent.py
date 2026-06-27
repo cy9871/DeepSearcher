@@ -19,6 +19,7 @@ if os.path.isdir(_venv):
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Literal
@@ -37,7 +38,6 @@ from .config import (
     ONLY_HOSTNAMES,
 )
 from .models import (
-    Action,
     AnswerAction,
     BoostedSnippet,
     KnowledgeItem,
@@ -67,124 +67,8 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 决策 Prompt（选择下一个动作）
+# 动作执行函数
 # ═══════════════════════════════════════════════════════════════════
-
-DECIDE_SYSTEM = """你是研究 Agent 的决策器。
-
-== 可用动作 ==
-1. visit — 读取待读队列中的 URL，获取正文事实。优先做这个。
-2. search — 用子问题搜索新信息。
-3. reflect — 分析已有知识的缺口。
-4. rewrite — 基于已有搜索结果改写查询词并重新搜索，覆盖信息盲区。
-5. answer — 输出最终答案。
-
-== 硬约束 ==
-- 待读 URL > 1 时，只能 visit，严禁 answer
-- 步骤 < 3 时，只能 visit 或 search，严禁 answer
-- 搜索后绝不能直接 answer，必须先读取搜索结果的正文
-- 已有搜索结果但知识不足时，优先用 rewrite 改进搜索词
-
-== 输出规则 ==
-只输出以下 JSON，不输出任何其他文字、解释、思考过程：
-{"type":"search","search_queries":["q1"],"think":""}
-{"type":"visit","urls_to_visit":["url"],"think":""}
-{"type":"reflect","gaps":["gap1"],"think":""}
-{"type":"rewrite","think":""}
-{"type":"answer","answer":"最终答案","think":""}
-"""
-
-
-async def _decide_action(state: dict) -> Action:
-    """LLM 决策：选择下一步动作"""
-    client = get_client()
-
-    context = _build_decision_context(state)
-
-    system = DECIDE_SYSTEM
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = await client.chat.completions.create(
-                model=LLM_CONFIG["model"],
-                messages=[
-                    {"role": "user", "content": f"(决策指令)\n{system}\n\n(当前状态)\n{context}"},
-                ],
-                temperature=0.0,
-                max_tokens=350,
-            )
-            content = resp.choices[0].message.content or "{}"
-            data = extract_json(content)
-            if not data:
-                raise ValueError(f"无有效 JSON: {content[:200]}")
-            action = Action(**data)
-            if not action.type or action.type not in ("search", "visit", "reflect", "rewrite", "answer"):
-                raise ValueError(f"无效动作类型: {action.type}")
-            logger.info(f"决策 → {action.type}: {str(action.think)[:50]}")
-            return action
-        except Exception as e:
-            logger.warning(f"决策 LLM 调用失败 (attempt {attempt+1}): {e}")
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
-            else:
-                # 最终回退：尝试回答
-                return Action(type="answer", answer="无法做出决策，请重试。", think="fallback")
-
-    return Action(type="answer", answer="无法做出决策，请重试。", think="fallback")
-
-
-def _build_decision_context(state: dict) -> str:
-    """构建决策上下文"""
-    parts = [f"## 原始问题\n{state['question']}"]
-
-    # 待读队列（serpCluster 自动生成）
-    todo = state.get("urls_to_visit", [])
-    visited = set(state.get("visited_urls", []))
-    pending = [u for u in todo if u not in visited]
-    if pending:
-        parts.append(f"\n## 待读 URL 队列 ({len(pending)} 个，必须 visit 后才能 answer)")
-        for url in pending[:5]:
-            snippet = state["all_urls"].get(url)
-            title = snippet.title if snippet else ""
-            parts.append(f"- [{title or url}]({url})")
-        if len(pending) > 5:
-            parts.append(f"  ...及其他 {len(pending)-5} 个")
-
-    # 当前知识缺口（来自上次反思）
-    gaps = state.get("gaps", [])
-    if gaps:
-        parts.append(f"\n## 当前知识缺口 ({len(gaps)} 个)")
-        for i, gap in enumerate(gaps, 1):
-            parts.append(f"{i}. {gap}")
-
-    # 已有知识（来自 visit 的正文提取）
-    if state["all_knowledge"]:
-        parts.append(f"\n## 已读取的知识 ({len(state['all_knowledge'])} 条)")
-        for i, k in enumerate(state["all_knowledge"][-5:], 1):
-            parts.append(f"{i}. Q: {k.question[:100]}\n   A: {k.answer[:200]}")
-
-    # 已发现的 URL（全部）
-    if state["all_urls"]:
-        urls = list(state["all_urls"].values())
-        unvisited = [u for u in urls if u.url not in visited]
-        still_new = [u for u in unvisited if u.url not in todo]
-        if still_new:
-            parts.append(f"\n## 其他未发现的 URL ({len(still_new)} 个，待 search 发现后入队)")
-
-    # 已访问的 URL
-    if visited:
-        parts.append(f"\n## 已访问 ({len(visited)} 个)")
-        for u in list(visited)[-3:]:
-            parts.append(f"- {u}")
-
-    # 操作日记
-    if state.get("diary_context"):
-        parts.append(f"\n## 操作记录\n" + "\n".join(state["diary_context"][-8:]))
-
-    # 步骤信息
-    parts.append(f"\n## 进度\n当前步骤: {state.get('step_count', 0)}/{MAX_TURNS}")
-
-    return "\n".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -216,6 +100,64 @@ def _filter_urls(urls: dict[str, Snippet], visited: set[str], bad_hostnames: set
     if skipped:
         logger.info(f"  URL 过滤: 跳过 {skipped} 个（已访问/坏域名/不在白名单）")
     return filtered
+
+
+async def _rerank_results(question: str, query: str, urls: dict[str, Snippet]) -> dict[str, Snippet]:
+    """
+    LLM relevance rerank：一次调用看批量 URLs，返回相关性最高的子集。
+    对应方案 A：搜索条数翻倍后，用 LLM 一次性筛出有价值的 URL。
+    """
+    if len(urls) <= 6:
+        return urls  # 不够 6 条就不用筛
+
+    try:
+        client = get_client()
+        items = []
+        for i, (url, sn) in enumerate(urls.items()):
+            items.append(f"[{i}] 标题: {sn.title or '无标题'[:80]}\n    摘要: {(sn.snippet or '')[:200]}\n    URL: {url}")
+        items_str = "\n---\n".join(items)
+
+        select_count = min(10, len(urls))  # 选 Top N 留给 serp_cluster 做域名摊平
+        prompt = f"""你是一个搜索结果过滤器。根据原始问题，从以下搜索结果中选择最相关的 {select_count} 条。
+只输出选中条目的编号列表（逗号分隔），不要任何其他文字。
+
+原始问题: {question}
+当前查询: {query}
+
+搜索结果:
+{items_str}
+
+输出格式: [1, 3, 5, 7, 9, 11]"""
+
+        resp = await client.chat.completions.create(
+            model=LLM_CONFIG["model"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=200,
+        )
+        content = resp.choices[0].message.content or ""
+        # 解析编号列表
+        indices = re.findall(r"\d+", content)
+        selected: set[int] = set()
+        for idx_str in indices:
+            try:
+                idx = int(idx_str)
+                if 0 <= idx < len(items):
+                    selected.add(idx)
+            except (ValueError, IndexError):
+                continue
+
+        if not selected:
+            logger.warning("  rerank 未返回有效编号，回退全量")
+            return urls
+
+        keys = list(urls.keys())
+        filtered = {keys[i]: urls[keys[i]] for i in sorted(selected)}
+        logger.info(f"  rerank: {len(urls)} → {len(filtered)} 条")
+        return filtered
+    except Exception as e:
+        logger.warning(f"  rerank 失败: {e}，回退全量")
+        return urls
 
 
 def _serp_cluster(urls: dict[str, Snippet], max_urls: int = 6, max_per_domain: int = 2) -> list[str]:
@@ -283,6 +225,9 @@ async def _execute_search(state: dict, queries: list[str]) -> dict:
         logger.warning("  URL 过滤后无可用链接")
         return {"all_urls": state["all_urls"]}
 
+    # ── LLM relevance rerank：从原始结果中筛出最相关的（方案 A）──
+    new_urls = await _rerank_results(state["question"], deduped_queries[0], new_urls)
+
     clustered_urls = _serp_cluster(new_urls, max_urls=6, max_per_domain=2)
     existing_todo = set(state.get("urls_to_visit", []))
     visited = set(state.get("visited_urls", []))
@@ -304,19 +249,11 @@ async def _execute_visit(state: dict, urls: list[str]) -> dict:
     urls_to_read = urls[:MAX_URLS_TO_READ]
     results = await read_tool.read_urls(urls_to_read)
 
-    new_knowledge: list[KnowledgeItem] = []
+    # 批量提取：一次 LLM 调用来处理所有成功下载的 URL
+    new_knowledge = await _batch_summarize(state["question"], results)
+
+    # 记录已访问 URL
     for r in results:
-        if r["success"]:
-            # 用 LLM 从正文中提取关键信息
-            summary = await _summarize_content(state["question"], r["title"], r["content"])
-            if summary:
-                new_knowledge.append(
-                    KnowledgeItem(
-                        question=state["question"],
-                        answer=summary,
-                        references=[r["url"]],
-                    )
-                )
         state.setdefault("visited_urls", []).append(r["url"])
 
     # ── 从待读队列移除已访问的 URL ──
@@ -326,39 +263,89 @@ async def _execute_visit(state: dict, urls: list[str]) -> dict:
 
     diary = [f"[visit] 读取 {len(urls_to_read)} URL → {len(new_knowledge)} 条知识"]
     state["diary_context"].extend(diary)
-
     logger.info(f"  读取完成: {len(new_knowledge)} 条新知识")
+
+    # ── diary 注入"路不通"信号 ──
+    visited_count = len(state.get("visited_urls", []))
+    knowledge_count = len(state.get("all_knowledge", [])) + len(new_knowledge)
+    remaining_todo = len(state["urls_to_visit"])
+    if remaining_todo == 0 and knowledge_count < 2:
+        state["diary_context"].append(
+            "[⚠️] 待读队列已清空，但收集的知识不足。"
+            "你无法再通过 visit 获取新信息，必须 reflect 找出信息缺口或 search 寻找新来源。"
+        )
+    elif visited_count >= 5 and knowledge_count < 2:
+        state["diary_context"].append(
+            f"[⚠️] 已读 {visited_count} 个 URL 但只提取了 {knowledge_count} 条知识。"
+            "继续 visit 收益可能很低，考虑 reflect 分析缺口或 search 换方向。"
+        )
+
     return {
         "all_knowledge": state["all_knowledge"] + new_knowledge,
         "visited_urls": state.get("visited_urls", []),
     }
 
 
-async def _summarize_content(question: str, title: str, content: str) -> str:
-    """用 LLM 从页面正文中提取与问题相关的关键信息"""
-    if not content or len(content) < 50:
-        return ""
+async def _batch_summarize(question: str, results: list[dict]) -> list[KnowledgeItem]:
+    """批量提取：一次 LLM 调用处理一批 URL 正文，输出全部知识"""
+    valid = []
+    for r in results:
+        if r["success"] and r.get("content") and len(r["content"]) >= 50:
+            valid.append(r)
+    if not valid:
+        return []
+
+    # 构造输入：编号 + 标题 + 正文片段
+    items = []
+    for i, r in enumerate(valid):
+        items.append(f"[{i}] 标题: {r.get('title', '')[:100]}\n    正文:\n{r['content'][:3000]}")
+    items_str = "\n\n---\n\n".join(items)
+
+    prompt = (
+        f"(系统指令)你是一个信息提取器。从下面 {len(valid)} 个页面的正文中，"
+        f"提取与问题相关的关键事实。\n\n"
+        f"对每个 [编号]，判断：\n"
+        f"- 页面与问题无关 → 输出 \"NO_MATCH\"\n"
+        f"- 页面相关 → 提取 2-5 句关键事实（只输出事实，不要评价）\n\n"
+        f"只输出 JSON 数组，不要任何其他文字：\n"
+        f'{{ "knowledge": [{{"idx": 0, "fact": "..."}}, ...] }}\n\n'
+        f"(输入)问题: {question}\n\n"
+        f"页面内容:\n{items_str}"
+    )
+
     try:
         client = get_client()
         resp = await client.chat.completions.create(
             model=LLM_CONFIG["model"],
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"(系统指令)你是一个信息提取器。从页面正文中提取与问题相关的关键事实。"
-                    f"只输出事实，不要评价。如果页面与问题无关，输出 NO_MATCH。\n\n"
-                    f"(输入)问题: {question}\n\n页面标题: {title}\n\n页面正文:\n{content[:4000]}",
-                },
-            ],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=800,
+            max_tokens=3000,
         )
-        result = resp.choices[0].message.content or ""
-        if "NO_MATCH" in result:
-            return ""
-        return clean_text(result)
-    except Exception:
-        return ""
+        content = resp.choices[0].message.content or "{}"
+        data = extract_json(content)
+        knowledge_list = data.get("knowledge", []) if data else []
+    except Exception as e:
+        logger.warning(f"batch_summarize 失败: {e}")
+        return []
+
+    # 从 json 结果重建 KnowledgeItem
+    new_knowledge: list[KnowledgeItem] = []
+    for entry in knowledge_list:
+        idx = entry.get("idx")
+        fact = entry.get("fact", "")
+        if idx is not None and fact and fact != "NO_MATCH":
+            try:
+                r = valid[int(idx)]
+                new_knowledge.append(KnowledgeItem(
+                    question=question,
+                    answer=clean_text(fact),
+                    references=[r["url"]],
+                ))
+            except (IndexError, ValueError):
+                continue
+
+    logger.info(f"  batch_summarize: {len(valid)} URL → {len(new_knowledge)} 条知识 (1 LLM call)")
+    return new_knowledge
 
 
 async def _execute_reflect(state: dict) -> dict:
@@ -385,9 +372,15 @@ async def _execute_reflect(state: dict) -> dict:
         data = extract_json(content)
         new_gaps = data.get("gaps", [])
 
-        diary = [f"[reflect] 发现 {len(new_gaps)} 个缺口: {', '.join(new_gaps[:3])}"]
+        new_gaps_count = len(new_gaps)
+        diary = [f"[reflect] 发现 {new_gaps_count} 个缺口: {', '.join(new_gaps[:3])}"]
+        if new_gaps_count == 0:
+            diary.append(
+                "[⚠️] reflect 未发现新缺口，说明当前搜索方向可能已枯竭。"
+                "必须换一个完全不同角度重新搜索。"
+            )
         state["diary_context"].extend(diary)
-        logger.info(f"  反思: {len(new_gaps)} 个新缺口")
+        logger.info(f"  反思: {new_gaps_count} 个新缺口")
 
         return {"gaps": new_gaps}
     except Exception as e:
@@ -404,7 +397,7 @@ async def _execute_rewrite(state: dict) -> dict:
         return await _execute_search(state, state["gaps"][:2])
 
     try:
-        # 提取已覆盖的子问题标题（每个 KnowledgeItem.question），只传标题不传正文
+        # 提取已覆盖的子问题标题
         all_knowledge = state.get("all_knowledge", [])
         covered_topics = [k.question for k in all_knowledge[-10:]] if all_knowledge else []
 
@@ -420,9 +413,12 @@ async def _execute_rewrite(state: dict) -> dict:
         logger.info(f"  改写查询: {new_queries}")
 
         # 用改写后的查询执行搜索
-        return await _execute_search(state, new_queries)
+        search_updates = await _execute_search(state, new_queries)
+        return search_updates
     except Exception as e:
         logger.warning(f"改写失败: {e}")
+        diary = [f"[rewrite] 改写失败, 回退到 gaps 搜索: {state['gaps'][:2]}"]
+        state["diary_context"].extend(diary)
         return await _execute_search(state, state["gaps"][:2])
 
 
@@ -585,7 +581,6 @@ async def deep_research(
         "diary_context": [],
         "raw_search_results": [],
         "all_keywords": [],       # 已搜索过的所有查询词（去重用）
-        "_search_just_done": False,  # 搜索后锁定 answer（先 visit 再答）
         "last_improvement_plan": "",
         "step_count": 0,
         "token_budget": token_budget,
@@ -611,317 +606,215 @@ async def deep_research(
         state["evaluation_types"] = q_eval.types
         state["diary_context"].append(f"[evaluate_question] 需要检查: {q_eval.types}")
         logger.info(f"  问题评估维度: {q_eval.types}")
-        # ── 时效性检测: freshness 问题第一步禁止 answer ──
         if "freshness" in q_eval.types:
-            state["_freshness_detected"] = True
             state["diary_context"].append(
-                "[⏰ freshness] 该问题对时效性敏感，第一步会强制搜索+读取最新信息"
+                "[⏰ freshness] 该问题对时效性敏感，将优先收集最新信息"
             )
-            logger.info("  ⏰ 时效性问题，禁止首轮 answer/reflect")
+            logger.info("  ⏰ 时效性问题，将优先收集最新信息")
     except Exception as e:
         logger.warning(f"问题评估失败: {e}")
         state["evaluation_types"] = ["definitive"]
 
     await _emit()
 
-    # ── 主循环 ──────────────────────────────────────────────────
+    # ── 主循环：每轮 = 1 次完整 search → visit → reflect → rewrite ──
     while state["step_count"] < max_turns:
+        # 一轮开始：step_count 是目标轮数序号
         state["step_count"] += 1
-        logger.info(f"\n─── 步骤 {state['step_count']}/{max_turns} ───")
+        logger.info(f"\n═══ 轮次 {state['step_count']}/{max_turns} ═══")
         state["diary_context"].append(f"")
-        state["diary_context"].append(f"═══ 步骤 {state['step_count']}/{max_turns} ═══")
+        state["diary_context"].append(f"═══ 轮次 {state['step_count']}/{max_turns} ═══")
         state["diary_context"].append(f"")
-        state["_step_todo_before"] = len([u for u in state.get("urls_to_visit", []) if u not in set(state.get("visited_urls", []))])
-        state["_step_knowledge_before"] = len(state.get("all_knowledge", []))
 
-        # 第一轮固定 search（跳过 LLM 决策，直接搜子问题）
-        if state["step_count"] == 1:
-            queries = state["gaps"][:3]
-            logger.info(f"  首轮 → search: {queries}")
-            t0 = time.monotonic()
-            updates = await _execute_search(state, queries)
-            dt_ms = (time.monotonic() - t0) * 1000
-            # 记录指标
-            urls_before = len([u for u in state.get("urls_to_visit", []) if u not in set(state.get("visited_urls", []))])
-            all_new_urls = updates.get("all_urls", {})
-            results_found = sum(1 for k in all_new_urls if k not in state.get("all_urls", {}))
-            metrics_collector.record_action(ActionRecord(
-                action_type="search",
-                step=state["step_count"],
-                success=results_found > 0,
-                elapsed_ms=dt_ms,
-                llm_calls=0,
-                extra={"queries": len(queries), "results_found": results_found, "urls_queued": 0},
-            ))
-            state.update(updates)
-            state["diary_context"].append(f"[step 1] 首轮搜索 {len(queries)} 个查询")
-            p = len([u for u in state.get("urls_to_visit", []) if u not in set(state.get("visited_urls", []))])
-            v = len(state.get("visited_urls", []))
-            k = len(state.get("all_knowledge", []))
-            state["diary_context"].append(f"  ├ 知识:{k} | 已读:{v} | 待读:{p}")
-            await _emit()
-            continue
-
-        # 第二轮及之后用 LLM 决策
         # 检查 budget
         if estimate_tokens(str(state)) > token_budget * (1 - BEAST_MODE_RATIO):
             logger.warning(f"Token 预算紧张 ({state['tokens_used']}/{token_budget})")
 
-        # 决策
-        action = await _decide_action(state)
-        state["current_action"] = action.type
-
-        # ── 硬拦截1：待读 URL > 0 且步骤 < 最大步数时，禁止 answer ──
-        todo = state.get("urls_to_visit", [])
-        visited = set(state.get("visited_urls", []))
-        unvisited_count = len([u for u in todo if u not in visited])
-        if action.type == "answer" and unvisited_count > 1 and state["step_count"] < max_turns - 1:
-            logger.info(f"  ⛔ 硬拦截：{unvisited_count} 个 URL 未读，强制 visit")
-            action.type = "visit"
-            state["diary_context"].append(f"[⛔ 硬拦截] 待读队列还有 {unvisited_count} 个 URL，禁止提前 answer")
-            metrics_collector.mark_hard_intercept()
-
-        # ── 硬拦截2：搜索后禁止立即 answer，必须先 visit 搜索结果 ──
-        if action.type == "answer" and state.get("_search_just_done"):
-            todo_now = state.get("urls_to_visit", [])
-            if todo_now and state["step_count"] < max_turns - 1:
-                logger.info(f"  ⛔ 硬拦截：搜索后禁止直接 answer，强制 visit")
-                action.type = "visit"
-                state["diary_context"].append(f"[⛔ 硬拦截] 搜索刚完成，必须先读取正文再回答")
-                metrics_collector.mark_hard_intercept()
-
-        # ── 硬拦截3：时效性检测 → 前3轮禁止 answer/reflect ──
-        if state.get("_freshness_detected") and state["step_count"] <= 3:
-            if action.type == "answer":
-                logger.info(f"  ⏰ 时效性问题，前3轮禁止 answer，强制 visit")
-                action.type = "visit"
-                state["diary_context"].append(
-                    "[⏰ freshness] 时效性问题需先收集最新信息，禁止提前回答"
-                )
-                metrics_collector.mark_hard_intercept()
-            elif action.type == "reflect":
-                logger.info(f"  ⏰ 时效性问题，前3轮禁止 reflect，先搜+读")
-                action.type = "visit"
-                state["diary_context"].append(
-                    "[⏰ freshness] 时效性问题先搜+读最新信息，暂不反思"
-                )
-                metrics_collector.mark_hard_intercept()
-
-        # 每轮后清除搜索标志（visit 后就可以 answer 了）
-        if action.type != "search":
-            state["_search_just_done"] = False
-
-        # 执行动作
+        # ═══════════════════════════════════════════
+        # 阶段 1/4: search
+        # ═══════════════════════════════════════════
+        search_queries = state.get("gaps", [])[:3]
+        if not search_queries:
+            search_queries = [state["question"]]
+        logger.info(f"  ① search: {search_queries}")
+        t0 = time.monotonic()
         try:
-            t_action_start = time.monotonic()
-            if action.type == "search":
-                updates = await _execute_search(state, action.search_queries or state["gaps"][:2])
-                # 搜索后锁定 answer（下一轮必须先 visit 结果）
-                state["_search_just_done"] = True
-                dt_ms = (time.monotonic() - t_action_start) * 1000
-                # 计算搜索效果
-                all_new_urls = updates.get("all_urls", {})
-                existing_urls = set(state.get("all_urls", {}).keys())
-                new_urls_count = sum(1 for k in all_new_urls if k not in existing_urls)
-                metrics_collector.record_action(ActionRecord(
-                    action_type="search",
-                    step=state["step_count"],
-                    success=new_urls_count > 0,
-                    elapsed_ms=dt_ms,
-                    llm_calls=0,  # search 本身不调 LLM
-                    extra={
-                        "queries": len(action.search_queries or state["gaps"][:2]),
-                        "results_found": new_urls_count,
-                        "urls_queued": 0,
-                    },
-                ))
-            elif action.type == "visit":
-                # 从待读队列取 URL
-                todo = state.get("urls_to_visit", [])
-                visited_set = set(state.get("visited_urls", []))
-                if action.urls_to_visit:
-                    target_urls = [u for u in action.urls_to_visit if u not in visited_set]
-                else:
-                    target_urls = [u for u in todo if u not in visited_set]
-                if not target_urls:
-                    logger.warning("  待读队列为空，回退到公海 URL")
-                    target_urls = [
-                        u.url for u in state["all_urls"].values()
-                        if u.url not in visited_set
-                    ][:MAX_URLS_TO_READ]
-                knowledge_before = len(state.get("all_knowledge", []))
-                updates = await _execute_visit(state, target_urls[:MAX_URLS_TO_READ])
-                dt_ms = (time.monotonic() - t_action_start) * 1000
-                knowledge_after = len(state.get("all_knowledge", [])) + len(updates.get("all_knowledge", []))
-                knowledge_gained = knowledge_after - knowledge_before
-                # 计算读取成功率
-                read_total = len(target_urls[:MAX_URLS_TO_READ])
-                visited_after = set(state.get("visited_urls", []) + updates.get("visited_urls", []))
-                read_failures = max(0, read_total - len(visited_after - visited_set))
-                metrics_collector.record_action(ActionRecord(
-                    action_type="visit",
-                    step=state["step_count"],
-                    success=knowledge_gained > 0,
-                    elapsed_ms=dt_ms,
-                    llm_calls=1,  # _summarize_content 调用 LLM
-                    extra={
-                        "urls_read": read_total,
-                        "knowledge_extracted": knowledge_gained,
-                        "read_failures": read_failures,
-                    },
-                ))
-            elif action.type == "reflect":
+            updates = await _execute_search(state, search_queries)
+            state.update(updates)
+        except Exception as e:
+            logger.warning(f"  search 失败: {e}")
+        dt_ms = (time.monotonic() - t0) * 1000
+        metrics_collector.record_action(ActionRecord(
+            action_type="search", step=state["step_count"],
+            success=True, elapsed_ms=dt_ms, llm_calls=0,
+            extra={"queries": len(search_queries)},
+        ))
+        await _emit()
+
+        # ═══════════════════════════════════════════
+        # 阶段 2/4: visit（把待读队列尽量读空）
+        # ═══════════════════════════════════════════
+        # 如果本轮有 2 次 visit 空间，尽量多读
+        visit_remaining = 2  # 每轮最多读 2 批
+
+        while visit_remaining > 0:
+            todo = state.get("urls_to_visit", [])
+            visited_set = set(state.get("visited_urls", []))
+            unvisited = [u for u in todo if u not in visited_set]
+            if not unvisited:
+                break  # 待读空了就跳到 reflect
+
+            target_urls = unvisited[:MAX_URLS_TO_READ]
+            logger.info(f"  ② visit({3-visit_remaining}): {len(target_urls)} 个 URL")
+            t0 = time.monotonic()
+            try:
+                updates = await _execute_visit(state, target_urls)
+                state.update(updates)
+            except Exception as e:
+                logger.warning(f"  visit 失败: {e}")
+            dt_ms = (time.monotonic() - t0) * 1000
+            metrics_collector.record_action(ActionRecord(
+                action_type="visit", step=state["step_count"],
+                success=True, elapsed_ms=dt_ms, llm_calls=1,
+                extra={"urls_read": len(target_urls)},
+            ))
+            await _emit()
+            visit_remaining -= 1
+
+        # visit 后注入"路不通"信号
+        visited_count = len(state.get("visited_urls", []))
+        knowledge_count = len(state.get("all_knowledge", []))
+        if visited_count >= 5 and knowledge_count < 2:
+            state["diary_context"].append(
+                f"[⚠️] 已读 {visited_count} 个 URL 但只提取了 {knowledge_count} 条知识，继续 visit 收益可能很低"
+            )
+
+        # ═══════════════════════════════════════════
+        # 阶段 3/4: reflect
+        # ═══════════════════════════════════════════
+        if knowledge_count >= 2:
+            logger.info(f"  ③ reflect")
+            t0 = time.monotonic()
+            try:
                 updates = await _execute_reflect(state)
-                dt_ms = (time.monotonic() - t_action_start) * 1000
-                gaps_found = len(updates.get("gaps", []))
-                metrics_collector.record_action(ActionRecord(
-                    action_type="reflect",
-                    step=state["step_count"],
-                    success=gaps_found > 0,
-                    elapsed_ms=dt_ms,
-                    llm_calls=1,
-                    extra={"gaps_found": gaps_found},
-                ))
-            elif action.type == "rewrite":
+                state.update(updates)
+            except Exception as e:
+                logger.warning(f"  reflect 失败: {e}")
+            dt_ms = (time.monotonic() - t0) * 1000
+            gaps_found = len(updates.get("gaps", [])) if isinstance(updates, dict) else 0
+            metrics_collector.record_action(ActionRecord(
+                action_type="reflect", step=state["step_count"],
+                success=gaps_found > 0, elapsed_ms=dt_ms, llm_calls=1,
+                extra={"gaps_found": gaps_found},
+            ))
+            await _emit()
+        else:
+            logger.info(f"  ③ reflect: 跳过（知识不足 {knowledge_count}<2）")
+
+        # ═══════════════════════════════════════════
+        # 阶段 4/4: rewrite（用反思结果改写搜索词）
+        # ═══════════════════════════════════════════
+        if state.get("gaps"):
+            logger.info(f"  ④ rewrite")
+            t0 = time.monotonic()
+            try:
                 updates = await _execute_rewrite(state)
-                dt_ms = (time.monotonic() - t_action_start) * 1000
-                metrics_collector.record_action(ActionRecord(
-                    action_type="rewrite",
-                    step=state["step_count"],
-                    success=bool(updates),
-                    elapsed_ms=dt_ms,
-                    llm_calls=1,
-                    extra={"queries_generated": 3},
-                ))
-            elif action.type == "answer":
-                # 生成答案 → 评估 → 决定是否继续
-                answer_state = await _execute_answer(state)
-                dt_ms_answer = (time.monotonic() - t_action_start) * 1000
-                state.update(answer_state)
+                state.update(updates)
+            except Exception as e:
+                logger.warning(f"  rewrite 失败: {e}")
+            dt_ms = (time.monotonic() - t0) * 1000
+            metrics_collector.record_action(ActionRecord(
+                action_type="rewrite", step=state["step_count"],
+                success=True, elapsed_ms=dt_ms, llm_calls=1,
+                extra={"queries_generated": 3},
+            ))
+            await _emit()
+        else:
+            logger.info(f"  ④ rewrite: 跳过（无 gaps）")
 
-                if not state.get("final_answer"):
-                    state["failed_attempts"] += 1
-                    metrics_collector.record_action(ActionRecord(
-                        action_type="answer",
-                        step=state["step_count"],
-                        success=False,
-                        elapsed_ms=dt_ms_answer,
-                        llm_calls=1,
-                        extra={"eval_passed": False, "eval_attempts": 0, "char_count": 0},
-                    ))
-                    continue
+        # ── 轮次快照 ──
+        p = len([u for u in state.get("urls_to_visit", []) if u not in set(state.get("visited_urls", []))])
+        v = len(state.get("visited_urls", []))
+        k = len(state.get("all_knowledge", []))
+        state["diary_context"].append(f"  ├ 知识:{k} | 已读:{v} | 待读:{p}")
 
+        # ── 轮次结束：answer 判定 ──
+        # 条件：知识≥3 且无待读 URL，或这是最后一轮
+        todo = state.get("urls_to_visit", [])
+        visited_set_after = set(state.get("visited_urls", []))
+        unvisited_after = len([u for u in todo if u not in visited_set_after])
+        should_answer = (
+            (len(state.get("all_knowledge", [])) >= 3 and unvisited_after == 0)
+            or state["step_count"] >= max_turns
+            or state.get("failed_attempts", 0) >= MAX_FAILURES
+        )
+
+        if should_answer:
+            t_as = time.monotonic()
+            ans_state = await _execute_answer(state)
+            dt_as = (time.monotonic() - t_as) * 1000
+            state.update(ans_state)
+
+            if state.get("final_answer"):
                 # 评估答案
                 eval_passed = False
-                eval_total_attempts = 0
-                for eval_attempt in range(NUM_EVALS_REQUIRED):
-                    answer_action = {"answer": state["final_answer"]}
+                eval_total = 0
+                for ea in range(NUM_EVALS_REQUIRED):
                     eval_passed, improvement_plan = await eval_tool.evaluate_answer(
                         question=question,
                         answer=state["final_answer"],
-                        answer_action=answer_action,
+                        answer_action={"answer": state["final_answer"]},
                         evaluation_types=state.get("evaluation_types", ["definitive"]),
                         all_knowledge=state["all_knowledge"],
                     )
-                    eval_total_attempts += 1
+                    eval_total += 1
                     if eval_passed:
                         break
-                    logger.info(f"  评估未通过，尝试 {eval_attempt+2}/{NUM_EVALS_REQUIRED+1}")
-                    # 将改进方案存入 state，下一轮 answer 会使用
+                    logger.info(f"  评估未通过 {ea+2}/{NUM_EVALS_REQUIRED+1}")
                     if improvement_plan:
                         state["last_improvement_plan"] = improvement_plan
                     metrics_collector.mark_eval_failure()
-                    # 重新生成答案
-                    updates = await _execute_answer(state)
-                    state.update(updates)
+                    ans_updates = await _execute_answer(state)
+                    state.update(ans_updates)
 
-                # 记录 answer 动作指标
                 metrics_collector.record_action(ActionRecord(
-                    action_type="answer",
-                    step=state["step_count"],
-                    success=eval_passed,
-                    elapsed_ms=dt_ms_answer,
-                    llm_calls=1 + eval_total_attempts,
-                    extra={
-                        "eval_passed": eval_passed,
-                        "eval_attempts": eval_total_attempts,
-                        "char_count": len(state.get("final_answer", "")),
-                        "eval_failed": not eval_passed and eval_total_attempts > 0,
-                    },
+                    action_type="answer", step=state["step_count"],
+                    success=eval_passed, elapsed_ms=dt_as,
+                    llm_calls=1 + eval_total,
+                    extra={"eval_passed": eval_passed, "eval_attempts": eval_total},
                 ))
-
                 if eval_passed:
-                    break  # 通过评估，退出循环
+                    break
                 else:
-                    state["failed_attempts"] += 1
-                    state["diary_context"].append("[evaluate] 答案未通过评估，继续研究")
-                    # ── 失败反馈环：将评估失败原因存为知识，指导后续迭代 ──
-                    last_plan = state.get("last_improvement_plan", "")
-                    if last_plan:
-                        state["all_knowledge"].append(KnowledgeItem(
-                            question=f"为什么以下答案对问题 '{question}' 不够好？需要改进什么？",
-                            answer=last_plan,
-                            references=[],
-                        ))
-                        logger.info(f"  📝 失败反馈已存入知识库 ({len(state['all_knowledge'])} 条)")
+                    state["failed_attempts"] = state.get("failed_attempts", 0) + 1
+                    state["diary_context"].append("[evaluate] 答案未通过，继续")
                     if state["failed_attempts"] >= MAX_FAILURES:
-                        logger.warning(f"达到最大失败次数 {MAX_FAILURES}，触发 Beast Mode")
                         t_bm = time.monotonic()
-                        updates = await _execute_beast_mode(state)
+                        bm_updates = await _execute_beast_mode(state)
                         dt_bm = (time.monotonic() - t_bm) * 1000
                         metrics_collector.mark_beast_mode(reason="max_failures")
                         metrics_collector.record_action(ActionRecord(
-                            action_type="beast_mode",
-                            step=state["step_count"],
-                            success=bool(state.get("final_answer", "")),
-                            elapsed_ms=dt_bm,
-                            llm_calls=1,
+                            action_type="beast_mode", step=state["step_count"],
+                            success=True, elapsed_ms=dt_bm, llm_calls=1,
                             extra={"trigger_reason": "max_failures"},
                         ))
-                        state.update(updates)
+                        state.update(bm_updates)
                         break
-                    continue
             else:
-                logger.warning(f"未知动作类型: {action.type}")
-                continue
-
-            state.update(updates)
-            await _emit()
-
-            # 步骤快照
-            p = len([u for u in state.get("urls_to_visit", []) if u not in set(state.get("visited_urls", []))])
-            v = len(state.get("visited_urls", []))
-            k = len(state.get("all_knowledge", []))
-            state["diary_context"].append(f"  ├ 知识:{k} | 已读:{v} | 待读:{p}")
-
-        except Exception as e:
-            logger.error(f"动作 {action.type} 执行失败: {e}")
-            state["failed_attempts"] += 1
-            state["diary_context"].append(f"[error] {action.type} 失败: {e}")
-            # 记录失败动作
-            metrics_collector.record_action(ActionRecord(
-                action_type=action.type,
-                step=state["step_count"],
-                success=False,
-                elapsed_ms=0,
-                llm_calls=0,
-                extra={"error": str(e), "llm_error": "LLM" in str(e) or "model" in str(e)},
-            ))
-            if state["failed_attempts"] >= MAX_FAILURES:
-                t_bm = time.monotonic()
-                updates = await _execute_beast_mode(state)
-                dt_bm = (time.monotonic() - t_bm) * 1000
-                metrics_collector.mark_beast_mode(reason="max_failures")
-                metrics_collector.record_action(ActionRecord(
-                    action_type="beast_mode",
-                    step=state["step_count"],
-                    success=bool(state.get("final_answer", "")),
-                    elapsed_ms=dt_bm,
-                    llm_calls=1,
-                    extra={"trigger_reason": "max_failures"},
-                ))
-                state.update(updates)
-                break
+                state["failed_attempts"] = state.get("failed_attempts", 0) + 1
+                state["diary_context"].append("[answer] 无法生成答案")
+                if state["failed_attempts"] >= MAX_FAILURES:
+                    t_bm = time.monotonic()
+                    bm_updates = await _execute_beast_mode(state)
+                    dt_bm = (time.monotonic() - t_bm) * 1000
+                    metrics_collector.mark_beast_mode(reason="max_failures")
+                    metrics_collector.record_action(ActionRecord(
+                        action_type="beast_mode", step=state["step_count"],
+                        success=True, elapsed_ms=dt_bm, llm_calls=1,
+                        extra={"trigger_reason": "max_failures"},
+                    ))
+                    state.update(bm_updates)
+                    break
 
     await _emit()
 

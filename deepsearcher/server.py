@@ -397,7 +397,7 @@ async def start_search(req: SearchRequest):
 
     task = SearchTask(
         question=req.question.strip(),
-        max_turns=min(req.max_turns, 20),
+        max_turns=min(req.max_turns, 10),
         token_budget=min(req.token_budget, 200000),
     )
     tasks[task.task_id] = task

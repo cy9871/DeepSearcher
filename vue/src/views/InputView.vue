@@ -41,8 +41,8 @@
                 <input
                   v-model.number="maxTurns"
                   type="range"
-                  min="3"
-                  max="10"
+                  min="1"
+                  max="5"
                   class="flex-1 h-1.5 appearance-none rounded-full bg-zinc-200 accent-accent-500 cursor-pointer"
                 />
                 <span class="min-w-[4rem] text-right text-sm tabular-nums text-zinc-500">
@@ -50,7 +50,7 @@
                 </span>
               </div>
               <p class="mt-1 text-xs text-zinc-400">
-                {{ maxTurns <= 5 ? '快速回答，约 1-2 分钟' : '深度研究，约 3-5 分钟' }}
+                {{ maxTurns <= 2 ? '快速回答' : '深度研究' }}
               </p>
             </div>
 
@@ -88,7 +88,7 @@ import { startSearch } from '../api/search.js'
 
 const router = useRouter()
 const question = ref('')
-const maxTurns = ref(5)
+const maxTurns = ref(3)
 const loading = ref(false)
 const error = ref('')
 
