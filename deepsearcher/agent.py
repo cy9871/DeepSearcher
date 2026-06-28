@@ -375,7 +375,7 @@ async def _batch_summarize(question: str, results: list[dict], concurrency: int 
 
 
 async def _execute_reflect(state: dict) -> dict:
-    """执行反思动作：分析知识缺口，生成子问题"""
+    """执行反思动作：分析已有知识，输出仍需调研的子问题（完整可搜索的句子）"""
     knowledge_text = format_knowledge_for_context(state["all_knowledge"])
 
     try:
@@ -384,16 +384,15 @@ async def _execute_reflect(state: dict) -> dict:
             messages=[
                 {
                     "role": "user",
-                    "content": f"(系统指令)你是一个研究员。分析已有知识，找出回答原始问题**真正必需**的信息缺口。"
-                    f"只输出 JSON 格式，不要任何其他文字：\n"
+                    "content": f"(系统指令)你是一个研究员。基于已有知识，找出为了完整体回答原始问题还需进一步调研的子问题。"
+                    f"每个子问题必须是可以直接搜索和回答的完整句子。只输出 JSON 格式，不要任何其他文字：\n"
                     f"{{\"gaps\": [\"子问题1\", \"子问题2\"], \"think\": \"分析\"}}\n\n"
                     f"严格规则（违者扣分）：\n"
-                    f"1. 只输出缺少后会**导致无法回答原始问题**的缺口。避坑、优化建议、锦上添花的信息不算缺口。\n"
-                    f"2. 删除任意一个缺口，如果已有知识仍能合理回答原始问题，说明它不是必要缺口 —— 不要输出它。\n"
+                    f"1. 只输出已有知识中尚未充分覆盖的子问题。已有信息足够的方向不要重复输出。\n"
+                    f"2. 删除任意一个子问题，如果已有知识仍能合理回答原始问题，说明它不是必要子问题 —— 不要输出它。\n"
                     f"3. 如果已有知识足够回答原始问题，gaps 输出空数组 []。\n"
-                    f"4. 高质量缺口示例：缺少核心数据、缺少关键定义、缺少因果链中的必要环节。\n"
-                    f"5. 低质量缺口（禁止输出）：缺少例子、缺少对比方案、缺少实现细节。\n\n"
-                    f"(输入)原始问题: {state['question']}\n\n已有知识:\n{knowledge_text}\n\n请找出真正必要的缺口。",
+                    f"4. 每个子问题必须完整、可直接搜索。反例：\"Llama 4 的架构细节\" → 正例：\"Llama 4 的 MoE 专家路由机制是如何工作的？\"\n\n"
+                    f"(输入)原始问题: {state['question']}\n\n已有知识:\n{knowledge_text}\n\n请输出还需调研的子问题。",
                 },
             ],
             temperature=0.0,
@@ -404,13 +403,13 @@ async def _execute_reflect(state: dict) -> dict:
         new_gaps = data.get("gaps", [])
 
         new_gaps_count = len(new_gaps)
-        diary = [f"[reflect] 发现 {new_gaps_count} 个必要缺口: {', '.join(new_gaps[:3])}"]
+        diary = [f"[reflect] 还需调研 {new_gaps_count} 个子问题: {', '.join(new_gaps[:3])}"]
         if new_gaps_count == 0:
             diary.append(
                 "[✅] reflect 确认已有知识足够回答，无需新搜索。"
             )
         state["diary_context"].extend(diary)
-        logger.info(f"  反思: {new_gaps_count} 个新缺口")
+        logger.info(f"  反思: {new_gaps_count} 个新子问题")
 
         return {"gaps": new_gaps}
     except Exception as e:
@@ -419,32 +418,31 @@ async def _execute_reflect(state: dict) -> dict:
 
 
 async def _execute_rewrite(state: dict) -> dict:
-    """执行改写动作：基于已有搜索结果改写查询词，返回改写后的查询词供下一轮 search 使用"""
-    raw_results = state.get("raw_search_results", [])
-    if not raw_results:
-        logger.warning("  无搜索结果可改写，下一轮将使用 gaps 搜索")
-        return {"rewritten_queries": state.get("gaps", [])[:3]}
+    """执行改写动作：基于已有知识，从 4 个认知人格角度生成多样化搜索词"""
+    # 从 all_knowledge 构建知识摘要（而非 raw_search_results 的表面信息）
+    all_knowledge = state.get("all_knowledge", [])
+    knowledge_text = " ".join(
+        f"[{k.question}] {k.answer[:150]}"
+        for k in all_knowledge[-20:]
+    )
+
+    if not knowledge_text.strip():
+        logger.warning("  无已有知识可改写")
+        return {"rewritten_queries": []}
 
     try:
-        all_knowledge = state.get("all_knowledge", [])
-        covered_topics = [k.question for k in all_knowledge[-10:]] if all_knowledge else []
-
         new_queries = await rewrite_tool.rewrite_queries(
             question=state["question"],
-            existing_results=raw_results,
-            gaps=state.get("gaps", []),
-            covered_topics=covered_topics,
-            num_queries=3,
+            knowledge=knowledge_text,
+            num_queries=4,
         )
-        diary = [f"[rewrite] 改写查询: {', '.join(new_queries[:3])}"]
+        diary = [f"[rewrite] 4 人格扩词: {', '.join(new_queries[:4])}"]
         state["diary_context"].extend(diary)
-        logger.info(f"  改写查询: {new_queries}")
+        logger.info(f"  改写查询({len(new_queries)}条): {new_queries[:3]}...")
         return {"rewritten_queries": new_queries}
     except Exception as e:
         logger.warning(f"改写失败: {e}")
-        diary = [f"[rewrite] 改写失败, 下一轮回退到 gaps: {state.get('gaps', [])[:3]}"]
-        state["diary_context"].extend(diary)
-        return {"rewritten_queries": state.get("gaps", [])[:3]}
+        return {"rewritten_queries": []}
 
 
 async def _execute_answer(state: dict) -> dict:
@@ -638,9 +636,10 @@ async def deep_research(
 
     await _emit()
 
-    # ── 主循环：每轮 = 1 次完整 search → visit → reflect → rewrite ──
+    # ── 主循环：每轮 = search → visit → reflect → rewrite ──
+    # rewrite 产出 rewritten_queries 给**下轮** search 用
+    # 第 1 轮用 gaps（planner 拆出的子问题），之后优先用 rewritten_queries
     while state["step_count"] < max_turns:
-        # 一轮开始：step_count 是目标轮数序号
         state["step_count"] += 1
         logger.info(f"\n═══ 轮次 {state['step_count']}/{max_turns} ═══")
         state["diary_context"].append(f"")
@@ -648,17 +647,17 @@ async def deep_research(
         state["diary_context"].append(f"")
 
         # ═══════════════════════════════════════════
-        # 阶段 1/4: search
+        # 阶段 1/4: search（优先用上轮 rewrite 的 rewritten_queries，其次用 gaps，再其次原始问题）
         # ═══════════════════════════════════════════
-        # 优先用 rewrite 改写的查询词，没有则用 gaps，再没有用原始问题
         rewritten_queries = state.pop("rewritten_queries", None)
         if rewritten_queries:
-            search_queries = rewritten_queries[:3]
+            search_queries = rewritten_queries[:4]
+            logger.info(f"  ① search(rewritten): {search_queries}")
         else:
             search_queries = state.get("gaps", [])[:3]
-        if not search_queries:
-            search_queries = [state["question"]]
-        logger.info(f"  ① search: {search_queries}")
+            if not search_queries:
+                search_queries = [state["question"]]
+            logger.info(f"  ① search(gaps): {search_queries}")
         t0 = time.monotonic()
         try:
             updates = await _execute_search(state, search_queries)
@@ -676,15 +675,14 @@ async def deep_research(
         # ═══════════════════════════════════════════
         # 阶段 2/4: visit（把待读队列尽量读空）
         # ═══════════════════════════════════════════
-        # 如果本轮有 2 次 visit 空间，尽量多读
-        visit_remaining = 2  # 每轮最多读 2 批
+        visit_remaining = 2
 
         while visit_remaining > 0:
             todo = state.get("urls_to_visit", [])
             visited_set = set(state.get("visited_urls", []))
             unvisited = [u for u in todo if u not in visited_set]
             if not unvisited:
-                break  # 待读空了就跳到 reflect
+                break
 
             target_urls = unvisited[:MAX_URLS_TO_READ]
             logger.info(f"  ② visit({3-visit_remaining}): {len(target_urls)} 个 URL")
@@ -712,7 +710,7 @@ async def deep_research(
             )
 
         # ═══════════════════════════════════════════
-        # 阶段 3/4: reflect
+        # 阶段 3/4: reflect（基于已有知识，产出新的子问题 gaps）
         # ═══════════════════════════════════════════
         if knowledge_count >= 2:
             logger.info(f"  ③ reflect")
@@ -722,6 +720,7 @@ async def deep_research(
                 state.update(updates)
             except Exception as e:
                 logger.warning(f"  reflect 失败: {e}")
+                updates = {"gaps": []}
             dt_ms = (time.monotonic() - t0) * 1000
             gaps_found = len(updates.get("gaps", [])) if isinstance(updates, dict) else 0
             metrics_collector.record_action(ActionRecord(
@@ -734,25 +733,29 @@ async def deep_research(
             logger.info(f"  ③ reflect: 跳过（知识不足 {knowledge_count}<2）")
 
         # ═══════════════════════════════════════════
-        # 阶段 4/4: rewrite（用反思结果改写搜索词）
+        # 阶段 4/4: rewrite（基于已有知识，4 人格生成多样化搜索词，给下轮 search 用）
         # ═══════════════════════════════════════════
-        if state.get("gaps"):
+        if knowledge_count >= 2:
             logger.info(f"  ④ rewrite")
-            t0 = time.monotonic()
+            t_rw = time.monotonic()
             try:
-                updates = await _execute_rewrite(state)
-                state.update(updates)
+                rw_updates = await _execute_rewrite(state)
+                state.update(rw_updates)
             except Exception as e:
                 logger.warning(f"  rewrite 失败: {e}")
-            dt_ms = (time.monotonic() - t0) * 1000
+                rw_updates = {"rewritten_queries": []}
+            dt_rw = (time.monotonic() - t_rw) * 1000
+            rw_count = len(rw_updates.get("rewritten_queries", []))
+            state["_rewrite_produced"] = rw_count > 0
             metrics_collector.record_action(ActionRecord(
                 action_type="rewrite", step=state["step_count"],
-                success=True, elapsed_ms=dt_ms, llm_calls=1,
-                extra={"queries_generated": 3},
+                success=rw_count > 0, elapsed_ms=dt_rw, llm_calls=1,
+                extra={"queries_generated": rw_count},
             ))
             await _emit()
         else:
-            logger.info(f"  ④ rewrite: 跳过（无 gaps）")
+            logger.info(f"  ④ rewrite: 跳过（知识不足 {knowledge_count}<2）")
+            state["_rewrite_produced"] = False
 
         # ── 轮次快照 ──
         p = len([u for u in state.get("urls_to_visit", []) if u not in set(state.get("visited_urls", []))])
@@ -761,10 +764,10 @@ async def deep_research(
         state["diary_context"].append(f"  ├ 知识:{k} | 已读:{v} | 待读:{p}")
 
         # ── 轮次结束：answer 判定 ──
-        # 退出条件（满足任一即答）：
+        # 退出条件：
         #   1. 达到最大轮次上限
         #   2. 失败次数超限
-        #   3. 无 gaps 且无 rewritten_queries → 反思和改写都没产出新搜索方向，提前退出
+        #   3. 无 gaps 且 rewrite 也没有 rewritten_queries → 两个方向都枯竭
         should_answer = (
             state["step_count"] >= max_turns
             or state.get("failed_attempts", 0) >= MAX_FAILURES
