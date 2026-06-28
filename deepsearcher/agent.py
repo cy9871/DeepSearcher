@@ -376,7 +376,7 @@ async def _batch_summarize(question: str, results: list[dict], concurrency: int 
 
 async def _execute_reflect(state: dict) -> dict:
     """执行反思动作：分析知识缺口，生成子问题"""
-    knowledge_text = format_knowledge_for_context(state["all_knowledge"][-5:])
+    knowledge_text = format_knowledge_for_context(state["all_knowledge"])
 
     try:
         resp = await chat_completion(
@@ -384,13 +384,19 @@ async def _execute_reflect(state: dict) -> dict:
             messages=[
                 {
                     "role": "user",
-                    "content": f"(系统指令)你是一个研究员。分析已有知识，找出信息缺口，生成 2-3 个待解决的子问题。"
+                    "content": f"(系统指令)你是一个研究员。分析已有知识，找出回答原始问题**真正必需**的信息缺口。"
                     f"只输出 JSON 格式，不要任何其他文字：\n"
                     f"{{\"gaps\": [\"子问题1\", \"子问题2\"], \"think\": \"分析\"}}\n\n"
-                    f"(输入)原始问题: {state['question']}\n\n已有知识:\n{knowledge_text}\n\n请找出信息缺口。",
+                    f"严格规则（违者扣分）：\n"
+                    f"1. 只输出缺少后会**导致无法回答原始问题**的缺口。避坑、优化建议、锦上添花的信息不算缺口。\n"
+                    f"2. 删除任意一个缺口，如果已有知识仍能合理回答原始问题，说明它不是必要缺口 —— 不要输出它。\n"
+                    f"3. 如果已有知识足够回答原始问题，gaps 输出空数组 []。\n"
+                    f"4. 高质量缺口示例：缺少核心数据、缺少关键定义、缺少因果链中的必要环节。\n"
+                    f"5. 低质量缺口（禁止输出）：缺少例子、缺少对比方案、缺少实现细节。\n\n"
+                    f"(输入)原始问题: {state['question']}\n\n已有知识:\n{knowledge_text}\n\n请找出真正必要的缺口。",
                 },
             ],
-            temperature=0.2,
+            temperature=0.0,
             max_tokens=1000,
         )
         content = resp.choices[0].message.content or "{}"
@@ -398,11 +404,10 @@ async def _execute_reflect(state: dict) -> dict:
         new_gaps = data.get("gaps", [])
 
         new_gaps_count = len(new_gaps)
-        diary = [f"[reflect] 发现 {new_gaps_count} 个缺口: {', '.join(new_gaps[:3])}"]
+        diary = [f"[reflect] 发现 {new_gaps_count} 个必要缺口: {', '.join(new_gaps[:3])}"]
         if new_gaps_count == 0:
             diary.append(
-                "[⚠️] reflect 未发现新缺口，说明当前搜索方向可能已枯竭。"
-                "必须换一个完全不同角度重新搜索。"
+                "[✅] reflect 确认已有知识足够回答，无需新搜索。"
             )
         state["diary_context"].extend(diary)
         logger.info(f"  反思: {new_gaps_count} 个新缺口")
