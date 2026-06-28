@@ -34,8 +34,6 @@ JINA_SEARCH_ENABLED = bool(JINA_SEARCH_API_KEY)
 
 # ── Agent 配置 ──────────────────────────────────────────────────
 MAX_TURNS = 20               # 最大循环轮次
-TOKEN_BUDGET = 100000        # 总 Token 预算
-BEAST_MODE_RATIO = 0.15      # Beast Mode 兜底预算占比
 MAX_FAILURES = 3             # 最大失败次数
 MAX_SEARCH_RESULTS = 10       # 每次搜索保留结果数（提高后由 LLM rerank 过滤）
 MAX_URLS_TO_READ = 3         # 每轮最多读取 URL 数

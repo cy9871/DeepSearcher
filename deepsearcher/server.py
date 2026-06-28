@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .agent import deep_research as deep_search
-from .config import MAX_TURNS, TOKEN_BUDGET
+from .config import MAX_TURNS
 from .evaluator.storage import MetricsStorage, compute_summary
 from .evaluator.reporter import MetricsReporter
 
@@ -38,11 +38,10 @@ logger = logging.getLogger("server")
 
 # ── 任务管理 ────────────────────────────────────────────────────
 class SearchTask:
-    def __init__(self, question: str, max_turns: int, token_budget: int, concurrency: int = 1):
+    def __init__(self, question: str, max_turns: int, concurrency: int = 1):
         self.task_id = uuid.uuid4().hex[:12]
         self.question = question
         self.max_turns = max_turns
-        self.token_budget = token_budget
         self.concurrency = concurrency
         self.queue: asyncio.Queue = asyncio.Queue()
         self.result: Optional[dict] = None
@@ -71,7 +70,6 @@ class SearchTask:
             result = await deep_search(
                 question=self.question,
                 max_turns=self.max_turns,
-                token_budget=self.token_budget,
                 concurrency=self.concurrency,
                 event_callback=on_event,
                 task_id=self.task_id,
@@ -389,7 +387,6 @@ class SearchRequest(BaseModel):
     question: str
     max_turns: int = MAX_TURNS
     concurrency: int = 1
-    token_budget: int = TOKEN_BUDGET
 
 
 @app.post("/api/search")
@@ -401,7 +398,6 @@ async def start_search(req: SearchRequest):
     task = SearchTask(
         question=req.question.strip(),
         max_turns=min(req.max_turns, 10),
-        token_budget=min(req.token_budget, 200000),
         concurrency=min(req.concurrency, 10),
     )
     tasks[task.task_id] = task

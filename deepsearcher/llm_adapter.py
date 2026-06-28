@@ -78,11 +78,13 @@ def _resolve_config() -> dict:
 
 
 def _find_local_config() -> Path | None:
-    """从当前工作目录向上查找 local_config.json
+    """查找 local_config.json
     
-    从 cwd 而非包目录开始查找，确保只有用户在项目根目录执行时
-    才会匹配到自己的 local_config.json。
+    优先级:
+    1. 从当前工作目录向上查找（一级优先，用户在项目根目录执行时命中）
+    2. 包自身所在的项目根目录（兜底，无论从哪启动都能找到）
     """
+    # L1: 从 CWD 向上查找
     current = Path.cwd()
     for _ in range(5):
         candidate = current / "local_config.json"
@@ -92,6 +94,13 @@ def _find_local_config() -> Path | None:
         if parent == current:
             break
         current = parent
+
+    # L2: 包自身所在的项目根目录（deepsearcher/..  = 项目根）
+    pkg_root = Path(__file__).resolve().parent.parent
+    candidate = pkg_root / "local_config.json"
+    if candidate.exists():
+        return candidate
+
     return None
 
 
@@ -104,15 +113,43 @@ def resolve_config() -> dict:
 
 
 def get_client() -> AsyncOpenAI:
-    """获取全局 AsyncOpenAI 客户端单例"""
+    """获取全局 AsyncOpenAI 客户端单例（关闭内置重试，由 chat_completion 统一控制）"""
     global _client
     if _client is None:
         cfg = resolve_config()
         _client = AsyncOpenAI(
             base_url=cfg["base_url"],
             api_key=cfg["api_key"],
+            max_retries=0,
         )
     return _client
+
+
+async def chat_completion(**kwargs) -> object:
+    """统一的 LLM 调用入口，自带 429 限速降级。
+    
+    NVIDIA 免费 API 分钟级配额用完后返回 429。
+    等 30 秒重试，最多重试 3 次再放弃。
+    30 秒约等于等分钟窗口滑动，大概率能续上。
+    """
+    import asyncio
+    import logging
+    from openai import APIStatusError
+
+    logger = logging.getLogger(__name__)
+    client = get_client()
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except APIStatusError as e:
+            if e.status_code == 429 and attempt < max_retries - 1:
+                logger.warning(f"LLM 429 限速，等待 30s 后重试 (第 {attempt+1}/{max_retries} 次)")
+                await asyncio.sleep(30)
+                continue
+            raise
+    raise RuntimeError("unreachable")
 
 
 def reset_client():

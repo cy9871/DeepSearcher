@@ -161,8 +161,6 @@ class AgentState(BaseModel):
     diary_context: list[str] = Field(default_factory=list)
     step_count: int = 0
     total_steps: int = 0
-    token_budget_used: int = 0
-    token_budget_total: int = 100000
     beast_mode_used: bool = False
     final_answer: str = ""
     references: list[str] = Field(default_factory=list)

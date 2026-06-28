@@ -6,7 +6,7 @@
 
 import json
 import logging
-from ..llm import get_client
+from ..llm import chat_completion
 from ..config import LLM_CONFIG
 from ..models import RewrittenQueries
 from ..utils.text_tools import extract_json
@@ -49,7 +49,6 @@ async def rewrite_queries(
         covered_topics: 已经收集充分的方向/子问题（仅标题，不传正文）
         num_queries: 生成查询词数量
     """
-    client = get_client()
 
     # 构建已有结果摘要
     existing_summary = "已有搜索结果:\n"
@@ -78,7 +77,7 @@ async def rewrite_queries(
 请生成 {num_queries} 个改写后的搜索查询词，覆盖信息盲区。
 """
 
-    resp = await client.chat.completions.create(
+    resp = await chat_completion(
         model=LLM_CONFIG["model"],
         messages=[
             {{"role": "user", "content": prompt}},

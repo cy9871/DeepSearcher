@@ -6,7 +6,7 @@
 
 import json
 import logging
-from ..llm import get_client
+from ..llm import chat_completion
 from ..config import LLM_CONFIG
 from ..models import (
     QuestionEvaluation,
@@ -25,8 +25,6 @@ logger = logging.getLogger(__name__)
 
 async def _llm_structured_call(system: str, prompt: str, response_model: type, example: str = "") -> dict:
     """调用 LLM 并返回结构化输出"""
-    client = get_client()
-
     # 用字段描述 + 示例替代原始 JSON Schema（避免 LLM 混淆）
     fields_desc = []
     for field_name, field_info in response_model.model_fields.items():
@@ -46,7 +44,7 @@ async def _llm_structured_call(system: str, prompt: str, response_model: type, e
 (输入){prompt}
 """
 
-    resp = await client.chat.completions.create(
+    resp = await chat_completion(
         model=LLM_CONFIG["model"],
         messages=[
             {"role": "user", "content": full_prompt},

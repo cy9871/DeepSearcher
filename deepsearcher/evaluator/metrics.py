@@ -85,11 +85,10 @@ class TaskMetrics:
 class MetricsCollector:
     """指标采集器 — 每个任务创建一个实例"""
 
-    def __init__(self, task_id: str, question: str, max_turns: int, token_budget: int):
+    def __init__(self, task_id: str, question: str, max_turns: int):
         self.task_id = task_id
         self.question = question
         self.max_turns = max_turns
-        self.token_budget = token_budget
 
         # 内部状态
         self._start_time = time.monotonic()

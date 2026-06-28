@@ -7,7 +7,7 @@
 import json
 import logging
 from ..config import LLM_CONFIG, TEAM_SIZE
-from ..llm import get_client
+from ..llm import chat_completion
 from ..models import ResearchPlan
 from ..utils.text_tools import extract_json
 
@@ -31,9 +31,7 @@ RESEARCH_PLANNER_SYSTEM = f"""你是一个研究主管，带领 {TEAM_SIZE} 名�
 
 async def plan_research(question: str, team_size: int = TEAM_SIZE) -> list[str]:
     """拆解研究问题为子问题列表"""
-    client = get_client()
-
-    resp = await client.chat.completions.create(
+    resp = await chat_completion(
         model=LLM_CONFIG["model"],
         messages=[
             {

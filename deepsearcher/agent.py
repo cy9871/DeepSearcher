@@ -2,7 +2,7 @@
 Deep Research 深度研究 Agent - LangGraph 主循环
 
 基于 node-DeepResearch 架构：
-5 个动作 × 六维质量门禁 × Token Budget 控制 × Beast Mode 兜底
+5 个动作 × 六维质量门禁 × Beast Mode 兜底
 """
 
 from __future__ import annotations
@@ -27,8 +27,6 @@ from typing import Literal
 from .config import (
     LLM_CONFIG,
     MAX_TURNS,
-    TOKEN_BUDGET,
-    BEAST_MODE_RATIO,
     MAX_FAILURES,
     MAX_URLS_TO_READ,
     NUM_EVALS_REQUIRED,
@@ -50,7 +48,6 @@ from .tools import evaluate as eval_tool
 from .tools import planner as plan_tool
 from .tools import rewrite as rewrite_tool
 from .llm import chat_completion
-from .utils.token_tracker import TokenTracker
 from .utils.text_tools import (
     clean_text,
     extract_json,
@@ -558,7 +555,6 @@ async def _execute_beast_mode(state: dict) -> dict:
 async def deep_research(
     question: str,
     max_turns: int = MAX_TURNS,
-    token_budget: int = TOKEN_BUDGET,
     concurrency: int = 1,
     event_callback=None,
     task_id: str = "",
@@ -569,7 +565,6 @@ async def deep_research(
     Args:
         question: 用户问题
         max_turns: 最大循环轮次
-        token_budget: 总 Token 预算
         concurrency: LLM 并发数（知识提取阶段并行调用数）
         event_callback: 可选异步回调(state: dict)，每完成一步后调用
 
@@ -580,7 +575,7 @@ async def deep_research(
         if event_callback:
             await event_callback(dict(state))
     logger.info(f"🔍 Deep Research 启动: {question[:60]}...")
-    logger.info(f"   budget={token_budget}, max_turns={max_turns}")
+    logger.info(f"   max_turns={max_turns}")
 
     # ── 指标采集器 ────────────────────────────────────────────
     if not task_id:
@@ -589,7 +584,6 @@ async def deep_research(
         task_id=task_id,
         question=question,
         max_turns=max_turns,
-        token_budget=token_budget,
     )
 
     # 初始化状态
@@ -606,8 +600,7 @@ async def deep_research(
         "all_keywords": [],       # 已搜索过的所有查询词（去重用）
         "last_improvement_plan": "",
         "step_count": 0,
-        "token_budget": token_budget,
-        "tokens_used": 0,        "beast_mode_used": False,
+        "beast_mode_used": False,
         "final_answer": "",
         "references": [],
         "failed_attempts": 0,
@@ -648,10 +641,6 @@ async def deep_research(
         state["diary_context"].append(f"")
         state["diary_context"].append(f"═══ 轮次 {state['step_count']}/{max_turns} ═══")
         state["diary_context"].append(f"")
-
-        # 检查 budget
-        if estimate_tokens(str(state)) > token_budget * (1 - BEAST_MODE_RATIO):
-            logger.warning(f"Token 预算紧张 ({state['tokens_used']}/{token_budget})")
 
         # ═══════════════════════════════════════════
         # 阶段 1/4: search
