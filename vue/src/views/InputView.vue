@@ -54,6 +54,26 @@
               </p>
             </div>
 
+            <!-- Concurrency -->
+            <div>
+              <label class="mb-2 block text-sm font-medium text-zinc-700">LLM 并发数</label>
+              <div class="flex items-center gap-4">
+                <input
+                  v-model.number="concurrency"
+                  type="range"
+                  min="1"
+                  max="5"
+                  class="flex-1 h-1.5 appearance-none rounded-full bg-zinc-200 accent-accent-500 cursor-pointer"
+                />
+                <span class="min-w-[4rem] text-right text-sm tabular-nums text-zinc-500">
+                  {{ concurrency }} 路
+                </span>
+              </div>
+              <p class="mt-1 text-xs text-zinc-400">
+                {{ concurrency === 1 ? '串行（默认）' : concurrency <= 2 ? '轻度并行' : '高速并行' }}
+              </p>
+            </div>
+
             <!-- Submit -->
             <button
               type="submit"
@@ -89,6 +109,7 @@ import { startSearch } from '../api/search.js'
 const router = useRouter()
 const question = ref('')
 const maxTurns = ref(3)
+const concurrency = ref(1)
 const loading = ref(false)
 const error = ref('')
 
@@ -98,7 +119,7 @@ async function handleSubmit() {
   error.value = ''
 
   try {
-    const data = await startSearch(question.value, maxTurns.value)
+    const data = await startSearch(question.value, maxTurns.value, concurrency.value)
     router.push({ name: 'running', params: { taskId: data.task_id } })
   } catch (e) {
     error.value = e.message || '请求失败，请检查后端是否运行'

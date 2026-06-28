@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+import re
 from ..utils.url_tools import is_valid_url
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,9 @@ def _fetch_trafilatura(url: str, max_chars: int) -> dict:
     if not result:
         return {"url": url, "title": "", "content": "", "success": False, "error": "无法提取正文"}
 
+    # ── 去掉代码块（```xxx```），代码实现占 token 且对知识提取无价值 ──
+    result = re.sub(r'```[\s\S]*?```', '', result)
+
     # ── 提取标题 ──
     title = ""
     try:
@@ -123,8 +127,11 @@ def _fetch_trafilatura(url: str, max_chars: int) -> dict:
     except Exception:
         pass
 
-    if len(result) > max_chars:
-        result = result[:max_chars] + "\n\n[... 内容已截断]"
+    # ── 安全上限（50000 字符），防止极端长页撑爆内存。
+    #     实际切块在 _batch_summarize 中按 \n\n 边界 + 30000 字符均分。
+    SAFE_LIMIT = 50000
+    if len(result) > SAFE_LIMIT:
+        result = result[:SAFE_LIMIT] + "\n\n[... 内容已达安全上限 50000 字符，已截断]"
 
     logger.info(f"读取 URL: {url} → {len(result)} 字符")
     return {"url": url, "title": title or url, "content": result, "success": True, "error": ""}

@@ -1,10 +1,10 @@
 const API_BASE = '/api'
 
-export async function startSearch(question, maxTurns = 5) {
+export async function startSearch(question, maxTurns = 5, concurrency = 1) {
   const res = await fetch(`${API_BASE}/search`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, max_turns: maxTurns }),
+    body: JSON.stringify({ question, max_turns: maxTurns, concurrency: concurrency }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()

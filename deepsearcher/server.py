@@ -38,11 +38,12 @@ logger = logging.getLogger("server")
 
 # ── 任务管理 ────────────────────────────────────────────────────
 class SearchTask:
-    def __init__(self, question: str, max_turns: int, token_budget: int):
+    def __init__(self, question: str, max_turns: int, token_budget: int, concurrency: int = 1):
         self.task_id = uuid.uuid4().hex[:12]
         self.question = question
         self.max_turns = max_turns
         self.token_budget = token_budget
+        self.concurrency = concurrency
         self.queue: asyncio.Queue = asyncio.Queue()
         self.result: Optional[dict] = None
         self.done = False
@@ -71,6 +72,7 @@ class SearchTask:
                 question=self.question,
                 max_turns=self.max_turns,
                 token_budget=self.token_budget,
+                concurrency=self.concurrency,
                 event_callback=on_event,
                 task_id=self.task_id,
             )
@@ -386,6 +388,7 @@ app.add_middleware(
 class SearchRequest(BaseModel):
     question: str
     max_turns: int = MAX_TURNS
+    concurrency: int = 1
     token_budget: int = TOKEN_BUDGET
 
 
@@ -399,6 +402,7 @@ async def start_search(req: SearchRequest):
         question=req.question.strip(),
         max_turns=min(req.max_turns, 10),
         token_budget=min(req.token_budget, 200000),
+        concurrency=min(req.concurrency, 10),
     )
     tasks[task.task_id] = task
     asyncio.create_task(task.run())

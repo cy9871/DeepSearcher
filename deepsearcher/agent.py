@@ -49,7 +49,7 @@ from .tools import read as read_tool
 from .tools import evaluate as eval_tool
 from .tools import planner as plan_tool
 from .tools import rewrite as rewrite_tool
-from .llm import get_client
+from .llm import chat_completion
 from .utils.token_tracker import TokenTracker
 from .utils.text_tools import (
     clean_text,
@@ -111,7 +111,6 @@ async def _rerank_results(question: str, query: str, urls: dict[str, Snippet]) -
         return urls  # 不够 6 条就不用筛
 
     try:
-        client = get_client()
         items = []
         for i, (url, sn) in enumerate(urls.items()):
             items.append(f"[{i}] 标题: {sn.title or '无标题'[:80]}\n    摘要: {(sn.snippet or '')[:200]}\n    URL: {url}")
@@ -129,7 +128,7 @@ async def _rerank_results(question: str, query: str, urls: dict[str, Snippet]) -
 
 输出格式: [1, 3, 5, 7, 9, 11]"""
 
-        resp = await client.chat.completions.create(
+        resp = await chat_completion(
             model=LLM_CONFIG["model"],
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
@@ -244,13 +243,13 @@ async def _execute_search(state: dict, queries: list[str]) -> dict:
     return {"all_urls": {**state["all_urls"], **new_urls}}
 
 
-async def _execute_visit(state: dict, urls: list[str]) -> dict:
+async def _execute_visit(state: dict, urls: list[str], concurrency: int = 1) -> dict:
     """执行读取 URL 动作"""
     urls_to_read = urls[:MAX_URLS_TO_READ]
     results = await read_tool.read_urls(urls_to_read)
 
-    # 批量提取：一次 LLM 调用来处理所有成功下载的 URL
-    new_knowledge = await _batch_summarize(state["question"], results)
+    # 批量提取：按 \n\n 边界切块，并行 LLM 提取
+    new_knowledge = await _batch_summarize(state["question"], results, concurrency=concurrency)
 
     # 记录已访问 URL
     for r in results:
@@ -286,8 +285,10 @@ async def _execute_visit(state: dict, urls: list[str]) -> dict:
     }
 
 
-async def _batch_summarize(question: str, results: list[dict]) -> list[KnowledgeItem]:
-    """批量提取：一次 LLM 调用处理一批 URL 正文，输出全部知识"""
+_CHUNK_SIZE = 30000  # 每块字符数（按 \n\n 边界对齐，≤ 此值）
+
+async def _batch_summarize(question: str, results: list[dict], concurrency: int = 1) -> list[KnowledgeItem]:
+    """批量提取：URL 正文按 \n\n 边界切 30000 字块，每块单独 LLM 调用并行提取知识"""
     valid = []
     for r in results:
         if r["success"] and r.get("content") and len(r["content"]) >= 50:
@@ -295,56 +296,84 @@ async def _batch_summarize(question: str, results: list[dict]) -> list[Knowledge
     if not valid:
         return []
 
-    # 构造输入：编号 + 标题 + 正文片段
-    items = []
-    for i, r in enumerate(valid):
-        items.append(f"[{i}] 标题: {r.get('title', '')[:100]}\n    正文:\n{r['content'][:3000]}")
-    items_str = "\n\n---\n\n".join(items)
+    # ── 切块：每个 URL 按 CHUNK_SIZE 边界切 ──
+    chunks: list[tuple[int, int, str, str, str]] = []  # (url_idx, chunk_idx, title, url, text)
+    for url_idx, r in enumerate(valid):
+        content = r["content"]
+        url = r["url"]
+        title = r.get("title", "")
+        if len(content) <= _CHUNK_SIZE:
+            chunks.append((url_idx, 0, title, url, content))
+        else:
+            offset = 0
+            chunk_idx = 0
+            while offset < len(content):
+                end = offset + _CHUNK_SIZE
+                if end >= len(content):
+                    chunks.append((url_idx, chunk_idx, title, url, content[offset:]))
+                    break
+                # 找最近的 \n\n 边界（最多回退 2000 字符）
+                boundary = content.rfind("\n\n", end - 2000, end)
+                if boundary > offset:
+                    end = boundary
+                chunks.append((url_idx, chunk_idx, title, url, content[offset:end]))
+                offset = end
+                chunk_idx += 1
 
-    prompt = (
-        f"(系统指令)你是一个信息提取器。从下面 {len(valid)} 个页面的正文中，"
-        f"提取与问题相关的关键事实。\n\n"
-        f"对每个 [编号]，判断：\n"
-        f"- 页面与问题无关 → 输出 \"NO_MATCH\"\n"
-        f"- 页面相关 → 提取 2-5 句关键事实（只输出事实，不要评价）\n\n"
-        f"只输出 JSON 数组，不要任何其他文字：\n"
-        f'{{ "knowledge": [{{"idx": 0, "fact": "..."}}, ...] }}\n\n'
-        f"(输入)问题: {question}\n\n"
-        f"页面内容:\n{items_str}"
-    )
+    # ── 并行提取 ──
+    sem = asyncio.Semaphore(concurrency)
 
-    try:
-        client = get_client()
-        resp = await client.chat.completions.create(
-            model=LLM_CONFIG["model"],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=3000,
-        )
-        content = resp.choices[0].message.content or "{}"
-        data = extract_json(content)
-        knowledge_list = data.get("knowledge", []) if data else []
-    except Exception as e:
-        logger.warning(f"batch_summarize 失败: {e}")
-        return []
-
-    # 从 json 结果重建 KnowledgeItem
-    new_knowledge: list[KnowledgeItem] = []
-    for entry in knowledge_list:
-        idx = entry.get("idx")
-        fact = entry.get("fact", "")
-        if idx is not None and fact and fact != "NO_MATCH":
+    async def _extract_one(url_idx, chunk_idx, title, url, text):
+        async with sem:
+            label = f"[{url_idx}]" if chunk_idx == 0 else f"[{url_idx}](续{chunk_idx})"
+            prompt = (
+                f"(系统指令)你是一个信息提取器。从以下页面片段中，"
+                f"提取与问题相关的关键事实。\n\n"
+                f"只输出 JSON，不要任何其他文字：\n"
+                f'{{"knowledge": [{{"fact": "..."}}, ...]}}\n'
+                f'或 {{"knowledge": ["NO_MATCH"]}}\n\n'
+                f"(输入)问题: {question}\n\n"
+                f"{label} 标题: {title[:100]}\n"
+                f"    正文:\n{text}"
+            )
             try:
-                r = valid[int(idx)]
-                new_knowledge.append(KnowledgeItem(
-                    question=question,
-                    answer=clean_text(fact),
-                    references=[r["url"]],
-                ))
-            except (IndexError, ValueError):
-                continue
+                resp = await chat_completion(
+                    model=LLM_CONFIG["model"],
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=2000,
+                )
+                content = resp.choices[0].message.content or "{}"
+                data = extract_json(content)
+                return (url_idx, url, data.get("knowledge", []) if data else [])
+            except Exception as e:
+                logger.warning(f"  提取 chunk [{url_idx}][{chunk_idx}] 失败: {e}")
+                return (url_idx, url, [])
 
-    logger.info(f"  batch_summarize: {len(valid)} URL → {len(new_knowledge)} 条知识 (1 LLM call)")
+    tasks = [_extract_one(*c) for c in chunks]
+    all_results = await asyncio.gather(*tasks)
+
+    # ── 汇总 ──
+    new_knowledge: list[KnowledgeItem] = []
+    for url_idx, url, facts in all_results:
+        for fact in facts:
+            if isinstance(fact, str):
+                if fact != "NO_MATCH" and fact.strip():
+                    new_knowledge.append(KnowledgeItem(
+                        question=question,
+                        answer=clean_text(fact),
+                        references=[url],
+                    ))
+            elif isinstance(fact, dict) and fact.get("fact"):
+                f = fact["fact"]
+                if f != "NO_MATCH" and f.strip():
+                    new_knowledge.append(KnowledgeItem(
+                        question=question,
+                        answer=clean_text(f),
+                        references=[url],
+                    ))
+
+    logger.info(f"  batch_summarize: {len(valid)} URL → {len(chunks)} chunks → {len(new_knowledge)} 条知识 ({concurrency} 并发)")
     return new_knowledge
 
 
@@ -353,8 +382,7 @@ async def _execute_reflect(state: dict) -> dict:
     knowledge_text = format_knowledge_for_context(state["all_knowledge"][-5:])
 
     try:
-        client = get_client()
-        resp = await client.chat.completions.create(
+        resp = await chat_completion(
             model=LLM_CONFIG["model"],
             messages=[
                 {
@@ -389,15 +417,13 @@ async def _execute_reflect(state: dict) -> dict:
 
 
 async def _execute_rewrite(state: dict) -> dict:
-    """执行改写动作：基于已有搜索结果改写查询词并重新搜索"""
-    # 取积累的原始搜索结果（最近优先）
+    """执行改写动作：基于已有搜索结果改写查询词，返回改写后的查询词供下一轮 search 使用"""
     raw_results = state.get("raw_search_results", [])
     if not raw_results:
-        logger.warning("  无搜索结果可改写，回退到 search")
-        return await _execute_search(state, state["gaps"][:2])
+        logger.warning("  无搜索结果可改写，下一轮将使用 gaps 搜索")
+        return {"rewritten_queries": state.get("gaps", [])[:3]}
 
     try:
-        # 提取已覆盖的子问题标题
         all_knowledge = state.get("all_knowledge", [])
         covered_topics = [k.question for k in all_knowledge[-10:]] if all_knowledge else []
 
@@ -411,15 +437,12 @@ async def _execute_rewrite(state: dict) -> dict:
         diary = [f"[rewrite] 改写查询: {', '.join(new_queries[:3])}"]
         state["diary_context"].extend(diary)
         logger.info(f"  改写查询: {new_queries}")
-
-        # 用改写后的查询执行搜索
-        search_updates = await _execute_search(state, new_queries)
-        return search_updates
+        return {"rewritten_queries": new_queries}
     except Exception as e:
         logger.warning(f"改写失败: {e}")
-        diary = [f"[rewrite] 改写失败, 回退到 gaps 搜索: {state['gaps'][:2]}"]
+        diary = [f"[rewrite] 改写失败, 下一轮回退到 gaps: {state.get('gaps', [])[:3]}"]
         state["diary_context"].extend(diary)
-        return await _execute_search(state, state["gaps"][:2])
+        return {"rewritten_queries": state.get("gaps", [])[:3]}
 
 
 async def _execute_answer(state: dict) -> dict:
@@ -433,8 +456,7 @@ async def _execute_answer(state: dict) -> dict:
         improvement_context = f"\n\n<改善指示>\n上次评估发现的问题（请务必修复）:\n{last_plan}\n</改善指示>"
 
     try:
-        client = get_client()
-        resp = await client.chat.completions.create(
+        resp = await chat_completion(
             model=LLM_CONFIG["model"],
             messages=[
                 {
@@ -490,8 +512,7 @@ async def _execute_beast_mode(state: dict) -> dict:
 
     knowledge_text = format_knowledge_for_context(state["all_knowledge"])
     try:
-        client = get_client()
-        resp = await client.chat.completions.create(
+        resp = await chat_completion(
             model=LLM_CONFIG["model"],
             messages=[
                 {
@@ -538,6 +559,7 @@ async def deep_research(
     question: str,
     max_turns: int = MAX_TURNS,
     token_budget: int = TOKEN_BUDGET,
+    concurrency: int = 1,
     event_callback=None,
     task_id: str = "",
 ) -> dict:
@@ -548,6 +570,7 @@ async def deep_research(
         question: 用户问题
         max_turns: 最大循环轮次
         token_budget: 总 Token 预算
+        concurrency: LLM 并发数（知识提取阶段并行调用数）
         event_callback: 可选异步回调(state: dict)，每完成一步后调用
 
     Returns:
@@ -633,7 +656,12 @@ async def deep_research(
         # ═══════════════════════════════════════════
         # 阶段 1/4: search
         # ═══════════════════════════════════════════
-        search_queries = state.get("gaps", [])[:3]
+        # 优先用 rewrite 改写的查询词，没有则用 gaps，再没有用原始问题
+        rewritten_queries = state.pop("rewritten_queries", None)
+        if rewritten_queries:
+            search_queries = rewritten_queries[:3]
+        else:
+            search_queries = state.get("gaps", [])[:3]
         if not search_queries:
             search_queries = [state["question"]]
         logger.info(f"  ① search: {search_queries}")
@@ -668,7 +696,7 @@ async def deep_research(
             logger.info(f"  ② visit({3-visit_remaining}): {len(target_urls)} 个 URL")
             t0 = time.monotonic()
             try:
-                updates = await _execute_visit(state, target_urls)
+                updates = await _execute_visit(state, target_urls, concurrency=concurrency)
                 state.update(updates)
             except Exception as e:
                 logger.warning(f"  visit 失败: {e}")
@@ -739,14 +767,14 @@ async def deep_research(
         state["diary_context"].append(f"  ├ 知识:{k} | 已读:{v} | 待读:{p}")
 
         # ── 轮次结束：answer 判定 ──
-        # 条件：知识≥3 且无待读 URL，或这是最后一轮
-        todo = state.get("urls_to_visit", [])
-        visited_set_after = set(state.get("visited_urls", []))
-        unvisited_after = len([u for u in todo if u not in visited_set_after])
+        # 退出条件（满足任一即答）：
+        #   1. 达到最大轮次上限
+        #   2. 失败次数超限
+        #   3. 无 gaps 且无 rewritten_queries → 反思和改写都没产出新搜索方向，提前退出
         should_answer = (
-            (len(state.get("all_knowledge", [])) >= 3 and unvisited_after == 0)
-            or state["step_count"] >= max_turns
+            state["step_count"] >= max_turns
             or state.get("failed_attempts", 0) >= MAX_FAILURES
+            or (not state.get("gaps") and not state.get("rewritten_queries"))
         )
 
         if should_answer:
